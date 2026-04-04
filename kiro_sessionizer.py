@@ -184,8 +184,8 @@ def select_session(sessions):
                 "--marker", "✓",
                 "--multi",
                 "--color", "header:italic:underline,pointer:bold:blue,marker:bold:green",
-                "--preview", f"python3 {__file__} --preview {{7}} {{9}} {{8}} {{2}}",
-                "--bind", f"ctrl-x:execute(python3 {__file__} --delete-multi {{+9}} --keys {{+7}})+reload(python3 {__file__} --list)",
+                "--preview", f"python3 {__file__} preview {{7}} {{9}} {{8}} {{2}}",
+                "--bind", f"ctrl-x:execute(python3 {__file__} delete-multi {{+9}} --keys {{+7}})+reload(python3 {__file__} list)",
                 "--info", "inline",
                 "--footer", f"{DIM}ctrl-x: delete  tab: select multi{RESET}",
             ],
@@ -359,36 +359,145 @@ def run_preview(path_ansi, conv_id_ansi, pid_ansi, project_ansi):
     except Exception as e:
         print(f"Error parsing preview: {e}")
 
-def main():
-    if len(sys.argv) > 1 and sys.argv[1] == "--preview":
-        run_preview(sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5] if len(sys.argv) > 5 else "")
+import argparse
+import shlex
+
+def dump_sessions(dest_dir, specific_session_id=None):
+    if not os.path.exists(DB_PATH):
+        print(f"Error: Database not found at {DB_PATH}", file=sys.stderr)
         return
 
-    if len(sys.argv) > 1 and sys.argv[1] == "--list":
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+
+    query = """
+    SELECT key, conversation_id, value, updated_at, 'v2' as source
+    FROM conversations_v2
+    UNION ALL
+    SELECT key, 'legacy' as conversation_id, value, 0 as updated_at, 'v1' as source
+    FROM conversations
+    ORDER BY updated_at DESC;
+    """
+
+    cursor.execute(query)
+    rows = cursor.fetchall()
+    conn.close()
+
+    dumped_count = 0
+    for row in rows:
+        key, conv_id, value, updated_at, source = row
+
+        if specific_session_id and specific_session_id != conv_id:
+            continue
+
+        try:
+            data = json.loads(value)
+            transcript = data.get("transcript", [])
+            model_info = data.get("model_info", {})
+            model = model_info.get("model_id", "auto")
+            dt = datetime.fromtimestamp(updated_at / 1000) if updated_at > 0 else datetime.now()
+            date_str = dt.strftime("%Y-%m-%d %H:%M:%S")
+
+            # Remove leading slash to make key a relative path for joining
+            # e.g. /Users/name/proj -> Users/name/proj
+            rel_key = key.lstrip(os.sep)
+
+            # Target directory structure
+            target_dir = os.path.join(os.path.abspath(dest_dir), rel_key)
+            os.makedirs(target_dir, exist_ok=True)
+
+            # Markdown file path
+            file_name = f"{conv_id}.md"
+            file_path = os.path.join(target_dir, file_name)
+
+            with open(file_path, "w", encoding="utf-8") as f:
+                # Write YAML frontmatter
+                f.write("---\n")
+                f.write(f"conversation_id: {conv_id}\n")
+                f.write(f"path: {key}\n")
+                f.write(f"model: {model}\n")
+                f.write(f"updated_at: {date_str}\n")
+                f.write("---\n\n")
+
+                # Write transcript
+                current_speaker = None
+                for line in transcript:
+                    line = line.strip()
+                    if not line: continue
+
+                    if line.startswith("> "):
+                        if current_speaker != "USER":
+                            f.write("\n## User\n\n")
+                            current_speaker = "USER"
+                        f.write(f"{line[2:].strip()}\n")
+                    elif line.startswith("[Tool uses:"):
+                        f.write(f"\n*{line}*\n")
+                    else:
+                        if current_speaker != "KIRO":
+                            f.write("\n## Assistant\n\n")
+                            current_speaker = "KIRO"
+                        content = line[10:].strip() if line.startswith("Assistant:") else line
+                        f.write(f"{content}\n")
+
+            dumped_count += 1
+            print(f"Dumped session {conv_id} to {file_path}", file=sys.stderr)
+
+        except Exception as e:
+            print(f"Error dumping session {conv_id}: {e}", file=sys.stderr)
+            continue
+
+    print(f"Successfully dumped {dumped_count} sessions.", file=sys.stderr)
+
+def main():
+    parser = argparse.ArgumentParser(description="Global session resume support for kiro-cli")
+    subparsers = parser.add_subparsers(dest="command")
+
+    # Internal subcommands used by fzf
+    parser_preview = subparsers.add_parser("preview", help=argparse.SUPPRESS)
+    parser_preview.add_argument("path")
+    parser_preview.add_argument("conv_id")
+    parser_preview.add_argument("pid")
+    parser_preview.add_argument("project", nargs="?", default="")
+
+    parser_list = subparsers.add_parser("list", help=argparse.SUPPRESS)
+
+    parser_delete = subparsers.add_parser("delete-multi", help=argparse.SUPPRESS)
+    parser_delete.add_argument("ids_str")
+    parser_delete.add_argument("--keys", required=True, dest="keys_str")
+
+    # User subcommands
+    parser_backup = subparsers.add_parser("backup", help="Dump sessions to markdown files")
+    parser_backup.add_argument("dest_dir", help="Directory to dump session markdown files into")
+    parser_backup.add_argument("--session-id", help="Optional specific session ID to dump")
+
+    args = parser.parse_args()
+
+    if args.command == "preview":
+        run_preview(args.path, args.conv_id, args.pid, args.project)
+        return
+
+    if args.command == "list":
         sessions = get_sessions()
         print("\n".join([s["display"] for s in sessions]))
         return
 
-    if len(sys.argv) > 1 and sys.argv[1] == "--delete-multi":
-        import shlex
-        # fzf passes {+9} as a single space-separated string if quoted, or multiple args if not.
-        # With the way we called it: --delete-multi {{+9}} --keys {{+6}}
-        # sys.argv[2] is all IDs, sys.argv[4] is all keys.
+    if args.command == "delete-multi":
         try:
-            keys_idx = sys.argv.index("--keys")
-            ids_str = sys.argv[2]
-            keys_str = sys.argv[keys_idx+1]
-            
-            conv_ids = shlex.split(ids_str)
-            keys = shlex.split(keys_str)
+            conv_ids = shlex.split(args.ids_str)
+            keys = shlex.split(args.keys_str)
             
             if len(conv_ids) == len(keys):
                 pairs = list(zip(conv_ids, keys))
                 delete_sessions(pairs)
-        except (ValueError, IndexError):
+        except ValueError:
             pass
         return
 
+    if args.command == "backup":
+        dump_sessions(args.dest_dir, args.session_id)
+        return
+
+    # Interactive picker mode
     sessions = get_sessions()
     if not sessions:
         print("No sessions found.", file=sys.stderr)
