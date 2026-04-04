@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+
+# This script must be sourced or used as eval "$(/path/to/kiro-sessionizer)"
+# to change the directory of the parent shell.
+# However, for a simple implementation that works as a command:
+
+COMMAND=$(/Users/blake/p/kiro-global-session-picker/kiro-sessionizer.py)
+
+if [ -n "$COMMAND" ]; then
+    eval "$COMMAND"
+fi
