@@ -1,0 +1,403 @@
+#!/usr/bin/env python3
+import sqlite3
+import json
+import os
+import sys
+import subprocess
+from datetime import datetime
+import re
+import glob
+
+DB_PATH = os.path.expanduser("~/Library/Application Support/kiro-cli/data.sqlite3")
+SESSIONS_DIR = os.path.expanduser("~/.kiro/sessions/cli")
+
+# ANSI Color Codes
+BLUE = "\033[34m"
+GREEN = "\033[32m"
+YELLOW = "\033[33m"
+CYAN = "\033[36m"
+MAGENTA = "\033[35m"
+RED = "\033[31m"
+BOLD = "\033[1m"
+DIM = "\033[2m"
+ITALIC = "\033[3m"
+RESET = "\033[0m"
+
+def strip_ansi(text):
+    return re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])').sub('', text)
+
+def is_process_running(pid):
+    """Check if a process with the given PID is running and is a kiro-cli process."""
+    try:
+        os.kill(pid, 0)
+        cmd = ["ps", "-p", str(pid), "-o", "command="]
+        output = subprocess.check_output(cmd, stderr=subprocess.STDOUT, text=True)
+        return "kiro-cli" in output or "bun" in output
+    except (OSError, subprocess.CalledProcessError):
+        return False
+def get_active_sessions():
+    """Scan ~/.kiro/sessions/cli for active lock files AND check running processes."""
+    active_paths = {}
+
+    # Method 1: Lock files (most reliable for TUI)
+    if os.path.exists(SESSIONS_DIR):
+        lock_files = glob.glob(os.path.join(SESSIONS_DIR, "*.lock"))
+        for lock_path in lock_files:
+            try:
+                with open(lock_path, 'r') as f:
+                    lock_data = json.load(f)
+                    pid = lock_data.get("pid")
+
+                    if pid and is_process_running(pid):
+                        json_path = lock_path.replace(".lock", ".json")
+                        if os.path.exists(json_path):
+                            with open(json_path, 'r') as jf:
+                                json_data = json.load(jf)
+                                cwd = json_data.get("cwd")
+                                if cwd:
+                                    active_paths[cwd] = pid
+            except Exception:
+                continue
+
+    # Method 2: Fallback for non-interactive/hidden sessions (ps + lsof)
+    try:
+        # Get PIDs of all processes whose command line contains 'kiro-cli'
+        ps_cmd = ["pgrep", "-f", "kiro-cli"]
+        pids = subprocess.check_output(ps_cmd, text=True).strip().split('\n')
+
+        for pid_str in pids:
+            if not pid_str: continue
+            pid = int(pid_str)
+            if pid in active_paths.values(): continue # Already found via lock
+
+            # Use lsof to find the CWD of the process
+            lsof_cmd = ["lsof", "-a", "-p", str(pid), "-d", "cwd", "-Fn"]
+            lsof_out = subprocess.check_output(lsof_cmd, text=True)
+            for line in lsof_out.split('\n'):
+                if line.startswith('n'):
+                    cwd = line[1:].strip()
+                    if cwd and cwd not in active_paths:
+                        active_paths[cwd] = pid
+    except Exception:
+        pass # Fallback failed, ignore
+
+    return active_paths
+
+
+def get_sessions():
+    if not os.path.exists(DB_PATH):
+        print(f"Error: Database not found at {DB_PATH}", file=sys.stderr)
+        sys.exit(1)
+
+    active_map = get_active_sessions()
+    
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    
+    query = """
+    SELECT key, conversation_id, value, updated_at, 'v2' as source
+    FROM conversations_v2
+    UNION ALL
+    SELECT key, 'legacy' as conversation_id, value, 0 as updated_at, 'v1' as source
+    FROM conversations
+    ORDER BY updated_at DESC;
+    """
+    
+    cursor.execute(query)
+    rows = cursor.fetchall()
+    conn.close()
+    
+    sessions = []
+    for row in rows:
+        key, conv_id, value, updated_at, source = row
+        try:
+            data = json.loads(value)
+            transcript = data.get("transcript", [])
+            history = data.get("history", [])
+            model_info = data.get("model_info", {})
+            model = model_info.get("model_id", "auto")
+            msg_count = len(history)
+            
+            # Extract first user message for better differentiation
+            preview = ""
+            first_user_msg = ""
+            for line in reversed(transcript):
+                if line.strip():
+                    stripped = line.strip()
+                    if stripped.startswith("> "):
+                        first_user_msg = stripped[2:].strip().replace("\n", " ")[:120]
+                    else:
+                        preview = stripped.replace("\n", " ")[:100]
+                    break
+            
+            dt = datetime.fromtimestamp(updated_at / 1000) if updated_at > 0 else datetime.now()
+            date_str = dt.strftime("%Y-%m-%d %H:%M")
+            
+            project = os.path.basename(key)
+            
+            # Active indicator
+            pid = active_map.get(key)
+            status_icon = f"{GREEN}● {RESET}" if pid else "  "
+
+            # 1:icon, 2:proj, 3:date, 4:model, 5:msgs, 6:key, 7:preview, 8:pid, 9:conv_id
+            display = (
+                f"{status_icon}\t"
+                f"{BOLD}{BLUE}{project}{RESET}\t"
+                f"{YELLOW}{date_str}{RESET}\t"
+                f"{CYAN}{model}{RESET}\t"
+                f"{MAGENTA}{msg_count}{RESET}\t"
+                f"{GREEN}{key}{RESET}\t"
+                f"{first_user_msg if first_user_msg else preview}\t"
+                f"{pid if pid else ''}\t"
+                f"{conv_id}"
+            )
+            
+            sessions.append({
+                "key": key,
+                "id": conv_id,
+                "display": display,
+                "source": source,
+                "pid": pid
+            })
+        except Exception:
+            continue
+            
+    return sessions
+
+def select_session(sessions):
+    fzf_input = "\n".join([s["display"] for s in sessions])
+    
+    try:
+        process = subprocess.Popen(
+            [
+                "fzf",
+                "--ansi",
+                "--delimiter", "\t",
+                "--with-nth", "1,2,3,4,5,7",
+                "--header", f"  {BOLD}{BLUE}Project {YELLOW}Date      {CYAN}Model     {MAGENTA}Msgs  {RESET}Last Message  {DIM}(ctrl-x: delete, tab: select multi){RESET}",
+                "--reverse",
+                "--height", "100%",
+                "--preview-window", "bottom:60%:wrap",
+                "--pointer", "▶",
+                "--marker", "✓",
+                "--multi",
+                "--color", "header:italic:underline,pointer:bold:blue,marker:bold:green",
+                "--preview", f"python3 {__file__} --preview \"{{6}}\" \"{{9}}\" \"{{8}}\" \"{{2}}\"",
+                "--bind", f"ctrl-x:execute(python3 {__file__} --delete-multi \"{{+9}}\" --keys \"{{+6}}\")+reload(python3 {__file__} --list)",
+            ],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=sys.stderr,
+            text=True
+        )
+        stdout, _ = process.communicate(input=fzf_input)
+        
+        if process.returncode != 0 or not stdout:
+            return None
+            
+        selected_lines = stdout.strip().split('\n')
+        if not selected_lines:
+            return None
+            
+        # Return the first one for the shell to cd into
+        selected_display = selected_lines[0]
+        stripped_selected = strip_ansi(selected_display)
+        
+        for s in sessions:
+            if strip_ansi(s["display"]) == stripped_selected:
+                return s
+    except FileNotFoundError:
+        print("Error: 'fzf' is not installed.", file=sys.stderr)
+        sys.exit(1)
+        
+    return None
+
+def delete_sessions(pairs):
+    """pairs: list of (conv_id, key) tuples"""
+    active_map = get_active_sessions()
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+
+    for conv_id, key in pairs:
+        # Kill active process if any
+        pid = active_map.get(key)
+        if pid:
+            try:
+                os.kill(pid, 15)  # SIGTERM
+            except OSError:
+                pass
+
+        # Delete from DB
+        if conv_id == "legacy":
+            cursor.execute("DELETE FROM conversations WHERE key = ?", (key,))
+        else:
+            cursor.execute(
+                "DELETE FROM conversations_v2 WHERE conversation_id = ? AND key = ?",
+                (conv_id, key)
+            )
+
+        # Remove session files
+        if conv_id != "legacy":
+            for ext in (".json", ".lock"):
+                path = os.path.join(SESSIONS_DIR, conv_id + ext)
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+
+    conn.commit()
+    conn.close()
+
+
+def update_session(session):
+    if session["source"] == "v1":
+        return
+
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    
+    now_ms = int(datetime.now().timestamp() * 1000)
+    cursor.execute(
+        "UPDATE conversations_v2 SET updated_at = ? WHERE conversation_id = ? AND key = ?",
+        (now_ms, session["id"], session["key"])
+    )
+    
+    conn.commit()
+    conn.close()
+
+def run_preview(path_ansi, conv_id, pid, project_ansi):
+    path = strip_ansi(path_ansi).strip()
+    conv_id = conv_id.strip()
+    pid = pid.strip()
+    project = strip_ansi(project_ansi).strip()
+    
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    
+    if conv_id == "legacy":
+        cursor.execute("SELECT value FROM conversations WHERE key = ?", (path,))
+    else:
+        cursor.execute(
+            "SELECT value FROM conversations_v2 WHERE conversation_id = ? AND key = ?",
+            (conv_id, path)
+        )
+    
+    row = cursor.fetchone()
+    conn.close()
+        
+    if not row:
+        print(f"No detailed data for session {conv_id} at {path}")
+        return
+
+    try:
+        data = json.loads(row[0])
+        model = data.get("model_info", {}).get("model_id", "auto")
+        history = data.get("history", [])
+        summary = data.get("latest_summary")
+        transcript = data.get("transcript", [])
+        
+        # Extract first user message for preview
+        first_user_msg = ""
+        for line in reversed(transcript):
+            if line.strip() and line.strip().startswith("> "):
+                first_user_msg = line.strip()[2:].strip().replace("\n", " ")[:150]
+                break
+        
+        try:
+            cols = os.get_terminal_size().columns
+        except:
+            cols = 80
+            
+        # Meta info header
+        status_line = f" {BOLD}{RED}● ACTIVE (PID: {pid}){RESET}" if pid else ""
+        print(f"{BOLD}{BLUE}PROJECT:{RESET} {project} {DIM}({path}){RESET}{status_line}")
+        print(f"{BOLD}{CYAN}MODEL:  {RESET} {model} | {BOLD}{MAGENTA}MESSAGES:{RESET} {len(history)}")
+        print(f"{DIM}ID:     {conv_id}{RESET}")
+        print("-" * cols)
+        
+        # Show first user message prominently for differentiation
+        if first_user_msg:
+            print(f"{BOLD}{CYAN}FIRST QUERY:{RESET}")
+            print(f"  {ITALIC}{first_user_msg}{RESET}")
+            print("-" * cols)
+        
+        if pid:
+            print(f"{BOLD}{RED}⚠️  WARNING: This session is currently active in another process.{RESET}")
+            print(f"{DIM}Resuming may cause conflicts or fail if the lock is held.{RESET}")
+            print("-" * cols)
+
+        if summary:
+            print(f"{BOLD}{YELLOW}SUMMARY:{RESET}")
+            print(f"{ITALIC}{summary}{RESET}")
+            print("-" * cols)
+            
+        print(f"{BOLD}CONVERSATION HISTORY:{RESET}\n")
+        
+        current_speaker = None
+        for line in transcript:
+            line = line.strip()
+            if not line: continue
+            
+            if line.startswith("> "):
+                if current_speaker != "USER":
+                    print(f"{BOLD}{CYAN}USER 👤{RESET}")
+                    current_speaker = "USER"
+                print(f"  {line[2:].strip()}\n")
+            elif line.startswith("[Tool uses:"):
+                print(f"  {DIM}{ITALIC}{line}{RESET}")
+            else:
+                if current_speaker != "KIRO":
+                    print(f"{BOLD}{GREEN}KIRO 🤖{RESET}")
+                    current_speaker = "KIRO"
+                content = line[10:].strip() if line.startswith("Assistant:") else line
+                print(f"  {content}\n")
+                    
+    except Exception as e:
+        print(f"Error parsing preview: {e}")
+
+def main():
+    if len(sys.argv) > 1 and sys.argv[1] == "--preview":
+        run_preview(sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5] if len(sys.argv) > 5 else "")
+        return
+
+    if len(sys.argv) > 1 and sys.argv[1] == "--list":
+        sessions = get_sessions()
+        print("\n".join([s["display"] for s in sessions]))
+        return
+
+    if len(sys.argv) > 1 and sys.argv[1] == "--delete-multi":
+        import shlex
+        # fzf passes {+9} as a single space-separated string if quoted, or multiple args if not.
+        # With the way we called it: --delete-multi "{+9}" --keys "{+6}"
+        # sys.argv[2] is all IDs, sys.argv[4] is all keys.
+        try:
+            keys_idx = sys.argv.index("--keys")
+            ids_str = sys.argv[2]
+            keys_str = sys.argv[keys_idx+1]
+            
+            conv_ids = shlex.split(ids_str)
+            keys = shlex.split(keys_str)
+            
+            if len(conv_ids) == len(keys):
+                pairs = list(zip(conv_ids, keys))
+                delete_sessions(pairs)
+        except (ValueError, IndexError):
+            pass
+        return
+
+    sessions = get_sessions()
+    if not sessions:
+        print("No sessions found.", file=sys.stderr)
+        return
+
+    selected = select_session(sessions)
+    if selected:
+        if selected["pid"]:
+            print(f"\n{BOLD}{YELLOW}Notice: Session is active (PID {selected['pid']}).{RESET}", file=sys.stderr)
+            print(f"{DIM}Attempting to resume...{RESET}\n", file=sys.stderr)
+            
+        update_session(selected)
+        print(f"cd '{selected['key']}' && kiro-cli chat --resume")
+
+if __name__ == "__main__":
+    main()
