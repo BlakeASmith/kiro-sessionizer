@@ -15,6 +15,20 @@ kiro-sessionizer
 
 This opens `fzf` with a list of all available sessions. Select one to automatically navigate to its working directory and resume that specific session.
 
+### Backing up Sessions
+
+You can dump all of your session transcripts into Markdown files using the `backup` subcommand. The command will recreate your file paths within the destination directory and populate the `.md` files with YAML frontmatter containing metadata about the session.
+
+```sh
+kiro-sessionizer backup /path/to/destination/dir
+```
+
+You can optionally dump a single specific session by passing its ID:
+
+```sh
+kiro-sessionizer backup /path/to/destination/dir --session-id "my_session_id"
+```
+
 ## Installation
 
 ```sh

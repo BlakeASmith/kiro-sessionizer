@@ -184,8 +184,8 @@ def select_session(sessions):
                 "--marker", "✓",
                 "--multi",
                 "--color", "header:italic:underline,pointer:bold:blue,marker:bold:green",
-                "--preview", f"python3 {__file__} --preview {{7}} {{9}} {{8}} {{2}}",
-                "--bind", f"ctrl-x:execute(python3 {__file__} --delete-multi {{+9}} --keys {{+7}})+reload(python3 {__file__} --list)",
+                "--preview", f"python3 {__file__} preview {{7}} {{9}} {{8}} {{2}}",
+                "--bind", f"ctrl-x:execute(python3 {__file__} delete-multi {{+9}} --keys {{+7}})+reload(python3 {__file__} list)",
                 "--info", "inline",
                 "--footer", f"{DIM}ctrl-x: delete  tab: select multi{RESET}",
             ],
@@ -440,28 +440,28 @@ def dump_sessions(dest_dir, specific_session_id=None):
                         f.write(f"{content}\n")
 
             dumped_count += 1
-            print(f"Dumped session {conv_id} to {file_path}")
+            print(f"Dumped session {conv_id} to {file_path}", file=sys.stderr)
 
         except Exception as e:
             print(f"Error dumping session {conv_id}: {e}", file=sys.stderr)
             continue
 
-    print(f"Successfully dumped {dumped_count} sessions.")
+    print(f"Successfully dumped {dumped_count} sessions.", file=sys.stderr)
 
 def main():
     parser = argparse.ArgumentParser(description="Global session resume support for kiro-cli")
     subparsers = parser.add_subparsers(dest="command")
 
     # Internal subcommands used by fzf
-    parser_preview = subparsers.add_parser("--preview", help=argparse.SUPPRESS)
+    parser_preview = subparsers.add_parser("preview", help=argparse.SUPPRESS)
     parser_preview.add_argument("path")
     parser_preview.add_argument("conv_id")
     parser_preview.add_argument("pid")
     parser_preview.add_argument("project", nargs="?", default="")
 
-    parser_list = subparsers.add_parser("--list", help=argparse.SUPPRESS)
+    parser_list = subparsers.add_parser("list", help=argparse.SUPPRESS)
 
-    parser_delete = subparsers.add_parser("--delete-multi", help=argparse.SUPPRESS)
+    parser_delete = subparsers.add_parser("delete-multi", help=argparse.SUPPRESS)
     parser_delete.add_argument("ids_str")
     parser_delete.add_argument("--keys", required=True, dest="keys_str")
 
@@ -472,16 +472,16 @@ def main():
 
     args = parser.parse_args()
 
-    if args.command == "--preview":
+    if args.command == "preview":
         run_preview(args.path, args.conv_id, args.pid, args.project)
         return
 
-    if args.command == "--list":
+    if args.command == "list":
         sessions = get_sessions()
         print("\n".join([s["display"] for s in sessions]))
         return
 
-    if args.command == "--delete-multi":
+    if args.command == "delete-multi":
         try:
             conv_ids = shlex.split(args.ids_str)
             keys = shlex.split(args.keys_str)
