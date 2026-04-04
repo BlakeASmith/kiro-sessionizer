@@ -26,6 +26,7 @@ pip install -e .
 ### Dependencies
 
 - `fzf` — [Install instructions](https://github.com/junegunn/fzf#installation)
+- `kiro-cli` — [Install instructions](https://kiro.dev/docs/cli/installation/)
 
 ## How does it work? 
 
