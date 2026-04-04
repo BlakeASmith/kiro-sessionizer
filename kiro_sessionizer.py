@@ -133,21 +133,23 @@ def get_sessions():
             dt = datetime.fromtimestamp(updated_at / 1000) if updated_at > 0 else datetime.now()
             date_str = dt.strftime("%Y-%m-%d %H:%M")
             
-            project = os.path.basename(key)
-            
+            project = os.path.basename(key)[:20]
+            model_short = model.split(".")[-1][:16] if "." in model else model[:16]
+            date_str = dt.strftime("%m-%d %H:%M")
+
             # Active indicator
             pid = active_map.get(key)
-            status_icon = f"{GREEN}● {RESET}" if pid else "  "
+            status_icon = f"{GREEN}●{RESET}" if pid else " "
 
-            # 1:icon, 2:proj, 3:date, 4:model, 5:msgs, 6:key, 7:preview, 8:pid, 9:conv_id
+            # 1:icon, 2:proj, 3:date, 4:model, 5:msgs, 6:preview, 7:key, 8:pid, 9:conv_id
             display = (
                 f"{status_icon}\t"
                 f"{BOLD}{BLUE}{project}{RESET}\t"
                 f"{YELLOW}{date_str}{RESET}\t"
-                f"{CYAN}{model}{RESET}\t"
+                f"{CYAN}{model_short}{RESET}\t"
                 f"{MAGENTA}{msg_count}{RESET}\t"
-                f"{GREEN}{key}{RESET}\t"
                 f"{first_user_msg if first_user_msg else preview}\t"
+                f"{GREEN}{key}{RESET}\t"
                 f"{pid if pid else ''}\t"
                 f"{conv_id}"
             )
@@ -173,8 +175,8 @@ def select_session(sessions):
                 "fzf",
                 "--ansi",
                 "--delimiter", "\t",
-                "--with-nth", "1,2,3,4,5,7",
-                "--header", f"  {BOLD}{BLUE}Project {YELLOW}Date      {CYAN}Model     {MAGENTA}Msgs  {RESET}Last Message  {DIM}(ctrl-x: delete, tab: select multi){RESET}",
+                "--with-nth", "1,2,3,4,5,6",
+                "--header", f"  {BOLD}{BLUE}Project              {YELLOW}Date        {CYAN}Model             {MAGENTA}Msgs  {RESET}Last Message  {DIM}(ctrl-x: delete, tab: select multi){RESET}",
                 "--reverse",
                 "--height", "100%",
                 "--preview-window", "bottom:60%:wrap",
@@ -182,8 +184,8 @@ def select_session(sessions):
                 "--marker", "✓",
                 "--multi",
                 "--color", "header:italic:underline,pointer:bold:blue,marker:bold:green",
-                "--preview", f"python3 {__file__} --preview \"{{6}}\" \"{{9}}\" \"{{8}}\" \"{{2}}\"",
-                "--bind", f"ctrl-x:execute(python3 {__file__} --delete-multi \"{{+9}}\" --keys \"{{+6}}\")+reload(python3 {__file__} --list)",
+                "--preview", f"python3 {__file__} --preview {{7}} {{9}} {{8}} {{2}}",
+                "--bind", f"ctrl-x:execute(python3 {__file__} --delete-multi {{+9}} --keys {{+7}})+reload(python3 {__file__} --list)",
             ],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
@@ -265,10 +267,10 @@ def update_session(session):
     conn.commit()
     conn.close()
 
-def run_preview(path_ansi, conv_id, pid, project_ansi):
+def run_preview(path_ansi, conv_id_ansi, pid_ansi, project_ansi):
     path = strip_ansi(path_ansi).strip()
-    conv_id = conv_id.strip()
-    pid = pid.strip()
+    conv_id = strip_ansi(conv_id_ansi).strip()
+    pid = strip_ansi(pid_ansi).strip()
     project = strip_ansi(project_ansi).strip()
     
     conn = sqlite3.connect(DB_PATH)
@@ -368,7 +370,7 @@ def main():
     if len(sys.argv) > 1 and sys.argv[1] == "--delete-multi":
         import shlex
         # fzf passes {+9} as a single space-separated string if quoted, or multiple args if not.
-        # With the way we called it: --delete-multi "{+9}" --keys "{+6}"
+        # With the way we called it: --delete-multi {{+9}} --keys {{+6}}
         # sys.argv[2] is all IDs, sys.argv[4] is all keys.
         try:
             keys_idx = sys.argv.index("--keys")
