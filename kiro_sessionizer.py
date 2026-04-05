@@ -84,6 +84,51 @@ def get_active_sessions():
     return active_paths
 
 
+def get_agents():
+    """Retrieve available agents from kiro-cli."""
+    try:
+        # Based on research, 'kiro-cli agent list' is the command.
+        # We'll try to get it, but if kiro-cli is missing or fails, return a default.
+        output = subprocess.check_output(["kiro-cli", "agent", "list"], text=True)
+        agents = []
+        for line in output.strip().split('\n'):
+            # Assuming 'kiro-cli agent list' returns a list of agent names
+            # We might need to strip colors or handle specific formatting
+            agent = strip_ansi(line).strip()
+            if agent and not agent.startswith("---"): # Basic filter for headers
+                agents.append(agent)
+        return agents
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        # Fallback to some common models if kiro-cli isn't available or command fails
+        return ["auto", "claude-sonnet-4.6", "claude-opus-4.6", "claude-haiku-4.5"]
+
+def select_agent(agents):
+    """Interactive fzf picker for agent selection."""
+    fzf_input = "\n".join(agents)
+    try:
+        process = subprocess.Popen(
+            [
+                "fzf",
+                "--ansi",
+                "--header", f"  {BOLD}{BLUE}Select an Agent/Model for the New Session{RESET}",
+                "--reverse",
+                "--height", "100%",
+                "--pointer", "▶",
+                "--color", "header:italic:underline,pointer:bold:blue",
+            ],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=sys.stderr,
+            text=True
+        )
+        stdout, _ = process.communicate(input=fzf_input)
+        if process.returncode == 0 and stdout:
+            return stdout.strip()
+    except FileNotFoundError:
+        print("Error: 'fzf' is not installed.", file=sys.stderr)
+        sys.exit(1)
+    return None
+
 def get_sessions():
     if not os.path.exists(DB_PATH):
         print(f"Error: Database not found at {DB_PATH}", file=sys.stderr)
@@ -91,6 +136,15 @@ def get_sessions():
 
     active_map = get_active_sessions()
     
+    # Prepend "NEW SESSION" entry
+    sessions = [{
+        "key": "NEW",
+        "id": "NEW",
+        "display": f"  {BOLD}{GREEN}+ NEW SESSION{RESET}\t\t\t\t\t\t\t\t",
+        "source": "internal",
+        "pid": None
+    }]
+
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     
@@ -107,7 +161,6 @@ def get_sessions():
     rows = cursor.fetchall()
     conn.close()
     
-    sessions = []
     for row in rows:
         key, conv_id, value, updated_at, source = row
         try:
@@ -467,7 +520,16 @@ def main():
     parser_backup.add_argument("dest_dir", help="Directory to dump session markdown files into")
     parser_backup.add_argument("--session-id", help="Optional specific session ID to dump")
 
+    parser_new = subparsers.add_parser("new", help="Start a new session with agent selection")
+
     args = parser.parse_args()
+
+    if args.command == "new":
+        agents = get_agents()
+        selected_agent = select_agent(agents)
+        if selected_agent:
+            print(f"kiro-cli chat --agent {selected_agent}")
+        return
 
     if args.command == "preview":
         run_preview(args.path, args.conv_id, args.pid, args.project)
@@ -502,6 +564,13 @@ def main():
 
     selected = select_session(sessions)
     if selected:
+        if selected["key"] == "NEW":
+            agents = get_agents()
+            selected_agent = select_agent(agents)
+            if selected_agent:
+                print(f"kiro-cli chat --agent {selected_agent}")
+            return
+
         if selected["pid"]:
             print(f"\n{BOLD}{YELLOW}Notice: Session is active (PID {selected['pid']}).{RESET}", file=sys.stderr)
             print(f"{DIM}Attempting to resume...{RESET}\n", file=sys.stderr)
