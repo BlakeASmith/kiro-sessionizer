@@ -4,8 +4,11 @@
 # to change the directory of the parent shell.
 # However, for a simple implementation that works as a command:
 
-COMMAND=$(kiro_sessionizer "$@")
-
-if [ -n "$COMMAND" ]; then
-    eval "$COMMAND"
+if [ $# -eq 0 ]; then
+    COMMAND=$(kiro_sessionizer)
+    if [ -n "$COMMAND" ]; then
+        eval "$COMMAND"
+    fi
+else
+    kiro_sessionizer "$@"
 fi
