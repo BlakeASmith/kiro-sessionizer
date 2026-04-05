@@ -186,7 +186,7 @@ def select_session(sessions):
         "--ansi",
         "--delimiter", "\t",
         "--with-nth", "1,2,3,4,5,6",
-        "--header", f"  {BOLD}{BLUE}Project              {YELLOW}Date        {CYAN}Model             {MAGENTA}Msgs  {RESET}Last Message",
+        "--header", f"\t{BOLD}{BLUE}Project{RESET}\t{YELLOW}Date{RESET}\t{CYAN}Model{RESET}\t{MAGENTA}Msgs{RESET}\tLast Message",
         "--reverse",
         "--height", "100%",
         "--preview-window", "bottom:80%:wrap",
