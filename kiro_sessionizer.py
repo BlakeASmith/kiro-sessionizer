@@ -166,29 +166,43 @@ def get_sessions():
             
     return sessions
 
+def is_fzf_tmux_supported():
+    if not os.environ.get("TMUX"):
+        return False
+    try:
+        result = subprocess.run(["fzf", "--help"], capture_output=True, text=True)
+        return "--tmux" in result.stdout
+    except Exception:
+        return False
+
 def select_session(sessions):
     fzf_input = "\n".join([s["display"] for s in sessions])
     
+    fzf_cmd = ["fzf"]
+    if is_fzf_tmux_supported():
+        fzf_cmd.append("--tmux")
+
+    fzf_cmd.extend([
+        "--ansi",
+        "--delimiter", "\t",
+        "--with-nth", "1,2,3,4,5,6",
+        "--header", f"  {BOLD}{BLUE}Project              {YELLOW}Date        {CYAN}Model             {MAGENTA}Msgs  {RESET}Last Message",
+        "--reverse",
+        "--height", "100%",
+        "--preview-window", "bottom:80%:wrap",
+        "--pointer", "▶",
+        "--marker", "✓",
+        "--multi",
+        "--color", "header:italic:underline,pointer:bold:blue,marker:bold:green",
+        "--preview", f"python3 {__file__} preview {{7}} {{9}} {{8}} {{2}}",
+        "--bind", f"ctrl-x:execute(python3 {__file__} delete-multi {{+9}} --keys {{+7}})+reload(python3 {__file__} list)",
+        "--info", "inline",
+        "--footer", f"{DIM}ctrl-x: delete  tab: select multi{RESET}",
+    ])
+
     try:
         process = subprocess.Popen(
-            [
-                "fzf",
-                "--ansi",
-                "--delimiter", "\t",
-                "--with-nth", "1,2,3,4,5,6",
-                "--header", f"  {BOLD}{BLUE}Project              {YELLOW}Date        {CYAN}Model             {MAGENTA}Msgs  {RESET}Last Message",
-                "--reverse",
-                "--height", "100%",
-                "--preview-window", "bottom:80%:wrap",
-                "--pointer", "▶",
-                "--marker", "✓",
-                "--multi",
-                "--color", "header:italic:underline,pointer:bold:blue,marker:bold:green",
-                "--preview", f"python3 {__file__} preview {{7}} {{9}} {{8}} {{2}}",
-                "--bind", f"ctrl-x:execute(python3 {__file__} delete-multi {{+9}} --keys {{+7}})+reload(python3 {__file__} list)",
-                "--info", "inline",
-                "--footer", f"{DIM}ctrl-x: delete  tab: select multi{RESET}",
-            ],
+            fzf_cmd,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=sys.stderr,
