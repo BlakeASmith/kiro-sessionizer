@@ -8,8 +8,8 @@ from datetime import datetime
 import re
 import glob
 
-DB_PATH = os.path.expanduser("~/Library/Application Support/kiro-cli/data.sqlite3")
-SESSIONS_DIR = os.path.expanduser("~/.kiro/sessions/cli")
+DB_PATH = os.environ.get("KIRO_DB_PATH") or os.path.expanduser("~/Library/Application Support/kiro-cli/data.sqlite3")
+SESSIONS_DIR = os.environ.get("KIRO_SESSIONS_DIR") or os.path.expanduser("~/.kiro/sessions/cli")
 
 # ANSI Color Codes
 BLUE = "\033[34m"
@@ -508,6 +508,107 @@ def dump_sessions(dest_dir, specific_session_id=None):
 
     print(f"Successfully dumped {dumped_count} sessions.", file=sys.stderr)
 
+def show_stats():
+    sessions = get_sessions()
+    if not sessions:
+        print("No sessions found.")
+        return
+
+    total = len(sessions)
+    models = {}
+    projects = {}
+    total_msgs = 0
+
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+
+    query = "SELECT value FROM conversations_v2 UNION ALL SELECT value FROM conversations"
+    cursor.execute(query)
+    for row in cursor.fetchall():
+        try:
+            data = json.loads(row[0])
+            model = data.get("model_info", {}).get("model_id", "unknown")
+            models[model] = models.get(model, 0) + 1
+
+            key = "unknown"
+            # We don't have the key directly here easily without more complex query but we can infer from sessions
+        except: continue
+    conn.close()
+
+    for s in sessions:
+        project = os.path.basename(s["key"])
+        projects[project] = projects.get(project, 0) + 1
+
+        # Extract message count from display (it's the 5th tab-separated field)
+        try:
+            parts = strip_ansi(s["display"]).split('\t')
+            total_msgs += int(parts[4])
+        except: pass
+
+    print(f"{BOLD}{BLUE}--- Kiro Sessionizer Statistics ---{RESET}")
+    print(f"{BOLD}Total Sessions:{RESET}  {total}")
+    print(f"{BOLD}Total Messages:{RESET}  {total_msgs}")
+    print(f"\n{BOLD}Top Projects:{RESET}")
+    for p, count in sorted(projects.items(), key=lambda x: x[1], reverse=True)[:5]:
+        print(f"  {p:20} {count} sessions")
+
+    print(f"\n{BOLD}Model Usage:{RESET}")
+    for m, count in sorted(models.items(), key=lambda x: x[1], reverse=True):
+        print(f"  {m:20} {count} sessions")
+
+def search_sessions(query):
+    all_sessions = get_sessions()
+    results = []
+
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+
+    query_lower = query.lower()
+
+    # Pre-filter using SQL LIKE for efficiency
+    sql_query = """
+    SELECT key, conversation_id FROM conversations_v2 WHERE value LIKE ?
+    UNION ALL
+    SELECT key, 'legacy' FROM conversations WHERE value LIKE ?
+    """
+    cursor.execute(sql_query, (f"%{query}%", f"%{query}%"))
+    matches = set(cursor.fetchall())
+
+    for s in all_sessions:
+        if (s["key"], s["id"]) not in matches:
+            continue
+
+        # Get full data to extract snippet
+        if s["id"] == "legacy":
+            cursor.execute("SELECT value FROM conversations WHERE key = ?", (s["key"],))
+        else:
+            cursor.execute("SELECT value FROM conversations_v2 WHERE conversation_id = ? AND key = ?", (s["id"], s["key"]))
+
+        row = cursor.fetchone()
+        if not row: continue
+
+        data = json.loads(row[0])
+        transcript_text = " ".join(data.get("transcript", []))
+        summary_text = data.get("latest_summary", "")
+        full_text = transcript_text + " " + summary_text
+
+        if query_lower in full_text.lower():
+            # Find a snippet from original text
+            idx = full_text.lower().find(query_lower)
+            start = max(0, idx - 40)
+            end = min(len(full_text), idx + 60)
+            snippet = full_text[start:end].replace("\n", " ")
+
+            # Update display to include snippet
+            parts = s["display"].split('\t')
+            # 1:icon, 2:proj, 3:date, 4:model, 5:msgs, 6:preview, 7:key, 8:pid, 9:conv_id
+            parts[5] = f"{YELLOW}...{snippet}...{RESET}"
+            s["display"] = "\t".join(parts)
+            results.append(s)
+
+    conn.close()
+    return results
+
 def main():
     parser = argparse.ArgumentParser(description="Global session resume support for kiro-cli")
     subparsers = parser.add_subparsers(dest="command")
@@ -531,6 +632,13 @@ def main():
     parser_backup.add_argument("--session-id", help="Optional specific session ID to dump")
 
     parser_new = subparsers.add_parser("new", help="Start a new session with agent selection")
+
+    parser_stats = subparsers.add_parser("stats", help="Show session statistics")
+
+    parser_continue = subparsers.add_parser("continue", help="Resume the most recent session")
+
+    parser_search = subparsers.add_parser("search", help="Search session transcripts")
+    parser_search.add_argument("query", help="Search term")
 
     args = parser.parse_args()
 
@@ -570,6 +678,34 @@ def main():
         dump_sessions(args.dest_dir, args.session_id)
         return
 
+    if args.command == "stats":
+        show_stats()
+        return
+
+    if args.command == "continue":
+        sessions = get_sessions()
+        if sessions:
+            selected = sessions[0] # sessions are sorted by updated_at DESC
+            update_session(selected)
+            safe_key = shlex.quote(selected['key'])
+            print(f"cd {safe_key} && kiro-cli chat --resume")
+        else:
+            print("No sessions found.", file=sys.stderr)
+        return
+
+    if args.command == "search":
+        results = search_sessions(args.query)
+        if not results:
+            print(f"No results found for '{args.query}'", file=sys.stderr)
+            return
+
+        selected = select_session(results)
+        if selected:
+            update_session(selected)
+            safe_key = shlex.quote(selected['key'])
+            print(f"cd {safe_key} && kiro-cli chat --resume")
+        return
+
     # Interactive picker mode
     sessions = get_sessions()
     if not sessions:
@@ -594,7 +730,8 @@ def main():
             print(f"{DIM}Attempting to resume...{RESET}\n", file=sys.stderr)
             
         update_session(selected)
-        print(f"cd '{selected['key']}' && kiro-cli chat --resume")
+        safe_key = shlex.quote(selected['key'])
+        print(f"cd {safe_key} && kiro-cli chat --resume")
 
 if __name__ == "__main__":
     main()
