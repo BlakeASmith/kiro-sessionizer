@@ -398,16 +398,13 @@ def dump_sessions(dest_dir, specific_session_id=None):
             dt = datetime.fromtimestamp(updated_at / 1000) if updated_at > 0 else datetime.now()
             date_str = dt.strftime("%Y-%m-%d %H:%M:%S")
 
-            # Remove leading slash to make key a relative path for joining
-            # e.g. /Users/name/proj -> Users/name/proj
-            rel_key = key.lstrip(os.sep)
-
-            # Target directory structure
-            target_dir = os.path.join(os.path.abspath(dest_dir), rel_key)
+            # Flatten structure: Use project name from key + conv_id for filename
+            project = os.path.basename(key.rstrip(os.sep))
+            target_dir = os.path.abspath(dest_dir)
             os.makedirs(target_dir, exist_ok=True)
 
-            # Markdown file path
-            file_name = f"{conv_id}.md"
+            # Markdown file path (flat)
+            file_name = f"{project}_{conv_id}.md"
             file_path = os.path.join(target_dir, file_name)
 
             with open(file_path, "w", encoding="utf-8") as f:
