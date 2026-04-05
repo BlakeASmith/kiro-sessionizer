@@ -88,29 +88,32 @@ def get_agents():
     """Retrieve available agents from kiro-cli."""
     try:
         # Based on research, 'kiro-cli agent list' is the command.
-        # We'll try to get it, but if kiro-cli is missing or fails, return a default.
         output = subprocess.check_output(["kiro-cli", "agent", "list"], text=True)
         agents = []
         for line in output.strip().split('\n'):
-            # Assuming 'kiro-cli agent list' returns a list of agent names
-            # We might need to strip colors or handle specific formatting
             agent = strip_ansi(line).strip()
-            if agent and not agent.startswith("---"): # Basic filter for headers
-                agents.append(agent)
+            if agent and not agent.startswith("---") and not agent.lower().startswith("available agents"):
+                # Clean up lines like "● my-agent" if they exist
+                agent = agent.lstrip("● ").strip()
+                if agent:
+                    agents.append(agent)
         return agents
     except (subprocess.CalledProcessError, FileNotFoundError):
-        # Fallback to some common models if kiro-cli isn't available or command fails
-        return ["auto", "claude-sonnet-4.6", "claude-opus-4.6", "claude-haiku-4.5"]
+        return []
 
 def select_agent(agents):
     """Interactive fzf picker for agent selection."""
+    if not agents:
+        print(f"{YELLOW}No agents found. Starting a default session.{RESET}", file=sys.stderr)
+        return "default"
+
     fzf_input = "\n".join(agents)
     try:
         process = subprocess.Popen(
             [
                 "fzf",
                 "--ansi",
-                "--header", f"  {BOLD}{BLUE}Select an Agent/Model for the New Session{RESET}",
+                "--header", f"  {BOLD}{BLUE}Select an Agent for the New Session{RESET}",
                 "--reverse",
                 "--height", "100%",
                 "--pointer", "▶",
@@ -328,6 +331,13 @@ def run_preview(path_ansi, conv_id_ansi, pid_ansi, project_ansi):
     pid = strip_ansi(pid_ansi).strip()
     project = strip_ansi(project_ansi).strip()
     
+    if path == "NEW":
+        print(f"{BOLD}{BLUE}START A NEW SESSION{RESET}")
+        print("-" * 40)
+        print("Select this option to start a fresh chat session.")
+        print("You will be prompted to choose an agent.")
+        return
+
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     
@@ -528,7 +538,11 @@ def main():
         agents = get_agents()
         selected_agent = select_agent(agents)
         if selected_agent:
-            print(f"kiro-cli chat --agent {selected_agent}")
+            if selected_agent == "default":
+                print("kiro-cli chat")
+            else:
+                import shlex
+                print(f"kiro-cli chat --agent {shlex.quote(selected_agent)}")
         return
 
     if args.command == "preview":
@@ -568,7 +582,11 @@ def main():
             agents = get_agents()
             selected_agent = select_agent(agents)
             if selected_agent:
-                print(f"kiro-cli chat --agent {selected_agent}")
+                if selected_agent == "default":
+                    print("kiro-cli chat")
+                else:
+                    import shlex
+                    print(f"kiro-cli chat --agent {shlex.quote(selected_agent)}")
             return
 
         if selected["pid"]:
