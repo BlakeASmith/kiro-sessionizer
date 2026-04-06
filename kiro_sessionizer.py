@@ -459,6 +459,74 @@ def dump_sessions(dest_dir, specific_session_id=None):
 
     print(f"Successfully dumped {dumped_count} sessions.", file=sys.stderr)
 
+def show_timeline():
+    sessions = get_sessions()
+    if not sessions:
+        print("No sessions found.")
+        return
+
+    print(f"{BOLD}{BLUE}--- Kiro Work Timeline ---{RESET}\n")
+
+    current_date = None
+
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+
+    for s in sessions:
+        # Get session data for snippet/summary
+        if s["id"] == "legacy":
+            cursor.execute("SELECT value, 0 FROM conversations WHERE key = ?", (s["key"],))
+        else:
+            cursor.execute("SELECT value, updated_at FROM conversations_v2 WHERE conversation_id = ? AND key = ?", (s["id"], s["key"]))
+
+        row = cursor.fetchone()
+        if not row: continue
+
+        value, updated_at = row
+        data = json.loads(value)
+        summary = data.get("latest_summary")
+        transcript = data.get("transcript", [])
+
+        if updated_at > 0:
+            dt = datetime.fromtimestamp(updated_at / 1000)
+            date_str = dt.strftime("%Y-%m-%d")
+            time_str = dt.strftime("%H:%M")
+
+            # Human-friendly dates
+            today = datetime.now().strftime("%Y-%m-%d")
+            yesterday = (datetime.now().timestamp() - 86400)
+            yesterday_str = datetime.fromtimestamp(yesterday).strftime("%Y-%m-%d")
+
+            display_date = date_str
+            if date_str == today:
+                display_date = "TODAY"
+            elif date_str == yesterday_str:
+                display_date = "YESTERDAY"
+        else:
+            display_date = "LEGACY / UNKNOWN"
+            time_str = "--:--"
+
+        if display_date != current_date:
+            print(f"\n{BOLD}{YELLOW}📅 {display_date}{RESET}")
+            current_date = display_date
+
+        project = os.path.basename(s["key"])
+
+        # Extract first user message if no summary
+        snippet = summary
+        if not snippet:
+            for line in reversed(transcript):
+                if line.strip() and line.strip().startswith("> "):
+                    snippet = line.strip()[2:].strip().replace("\n", " ")[:100]
+                    break
+
+        if not snippet and transcript:
+            snippet = transcript[-1].replace("\n", " ")[:100]
+
+        print(f"  {CYAN}{time_str}{RESET}  {BOLD}{BLUE}{project:15}{RESET}  {snippet if snippet else DIM + '(no content)' + RESET}")
+
+    conn.close()
+
 def show_stats():
     sessions = get_sessions()
     if not sessions:
@@ -584,7 +652,10 @@ def main():
 
     parser_stats = subparsers.add_parser("stats", help="Show session statistics")
 
+    parser_timeline = subparsers.add_parser("timeline", help="Show a chronological view of work")
+
     parser_continue = subparsers.add_parser("continue", help="Resume the most recent session")
+    parser_continue.add_argument("--project", help="Resume the most recent session for a specific project")
 
     parser_search = subparsers.add_parser("search", help="Search session transcripts")
     parser_search.add_argument("query", help="Search term")
@@ -620,15 +691,34 @@ def main():
         show_stats()
         return
 
+    if args.command == "timeline":
+        show_timeline()
+        return
+
     if args.command == "continue":
         sessions = get_sessions()
-        if sessions:
-            selected = sessions[0] # sessions are sorted by updated_at DESC
-            update_session(selected)
-            safe_key = shlex.quote(selected['key'])
-            print(f"cd {safe_key} && kiro-cli chat --resume")
-        else:
+        if not sessions:
             print("No sessions found.", file=sys.stderr)
+            return
+
+        selected = None
+        if args.project:
+            project_query = args.project.lower()
+            for s in sessions:
+                project_name = os.path.basename(s["key"]).lower()
+                if project_query in project_name:
+                    selected = s
+                    break
+
+            if not selected:
+                print(f"No recent session found for project matching '{args.project}'", file=sys.stderr)
+                return
+        else:
+            selected = sessions[0] # sessions are sorted by updated_at DESC
+
+        update_session(selected)
+        safe_key = shlex.quote(selected['key'])
+        print(f"cd {safe_key} && kiro-cli chat --resume")
         return
 
     if args.command == "search":
