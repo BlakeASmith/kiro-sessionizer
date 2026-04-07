@@ -4,9 +4,10 @@ import json
 import os
 import sys
 import subprocess
-from datetime import datetime
+from datetime import datetime, timedelta
 import re
 import glob
+from collections import defaultdict
 
 DB_PATH = os.environ.get("KIRO_DB_PATH") or os.path.expanduser("~/Library/Application Support/kiro-cli/data.sqlite3")
 SESSIONS_DIR = os.environ.get("KIRO_SESSIONS_DIR") or os.path.expanduser("~/.kiro/sessions/cli")
@@ -159,7 +160,9 @@ def get_sessions():
                 "id": conv_id,
                 "display": display,
                 "source": source,
-                "pid": pid
+                "pid": pid,
+                "updated_at": updated_at,
+                "data": data
             })
         except Exception:
             continue
@@ -507,6 +510,127 @@ def show_stats():
     for m, count in sorted(models.items(), key=lambda x: x[1], reverse=True):
         print(f"  {m:20} {count} sessions")
 
+def show_timeline():
+    sessions = get_sessions()
+    if not sessions:
+        print("No sessions found.")
+        return
+
+    now = datetime.now()
+    today = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    yesterday = today - timedelta(days=1)
+
+    groups = defaultdict(list)
+
+    for s in sessions:
+        if s["id"] == "legacy":
+            groups["LEGACY / UNKNOWN"].append(s)
+            continue
+
+        dt = datetime.fromtimestamp(s["updated_at"] / 1000)
+        if dt >= today:
+            group_key = "TODAY"
+        elif dt >= yesterday:
+            group_key = "YESTERDAY"
+        else:
+            group_key = dt.strftime("%Y-%m-%d")
+
+        # Get snippet prioritization from pre-fetched data
+        data = s.get("data", {})
+        summary = data.get("latest_summary")
+        transcript = data.get("transcript", [])
+
+        first_user_msg = ""
+        for line in transcript:
+            if line.startswith("> "):
+                first_user_msg = line[2:].strip().replace("\n", " ")[:100]
+                break
+
+        last_msg = ""
+        if transcript:
+            last_msg = transcript[-1].replace("\n", " ")[:100]
+            if last_msg.startswith("Assistant:"):
+                last_msg = last_msg[10:].strip()
+
+        snippet = summary or first_user_msg or last_msg
+        s["timeline_snippet"] = snippet
+
+        groups[group_key].append(s)
+
+    # Predefined order for Today/Yesterday, then sorted descending for others
+    predefined = ["TODAY", "YESTERDAY"]
+    other_keys = sorted([k for k in groups.keys() if k not in predefined and k != "LEGACY / UNKNOWN"], reverse=True)
+    all_keys = predefined + other_keys
+    if "LEGACY / UNKNOWN" in groups:
+        all_keys.append("LEGACY / UNKNOWN")
+
+    for key in all_keys:
+        if not groups[key]: continue
+        print(f"\n{BOLD}{BLUE}--- {key} ---{RESET}")
+        for s in groups[key]:
+            project = os.path.basename(s["key"])
+            snippet = s.get("timeline_snippet", "")
+            time_str = ""
+            if s["updated_at"] > 0:
+                time_str = datetime.fromtimestamp(s["updated_at"] / 1000).strftime("%H:%M")
+
+            print(f"  {YELLOW}{time_str:5}{RESET}  {BOLD}{project:15}{RESET}  {DIM}{snippet}{RESET}")
+
+def show_report():
+    sessions = get_sessions()
+    if not sessions:
+        print("No sessions found.")
+        return
+
+    now = datetime.now()
+    today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+
+    project_summaries = defaultdict(list)
+
+    found_today = False
+    for s in sessions:
+        if s["id"] == "legacy": continue
+
+        dt = datetime.fromtimestamp(s["updated_at"] / 1000)
+        if dt < today_start: continue
+
+        found_today = True
+        project = os.path.basename(s["key"])
+
+        # Use pre-fetched data
+        data = s.get("data", {})
+        summary = data.get("latest_summary")
+
+        if not summary:
+            # Fallback to first user message
+            transcript = data.get("transcript", [])
+            for line in transcript:
+                if line.startswith("> "):
+                    summary = line[2:].strip()
+                    break
+
+        if summary:
+            project_summaries[project].append(summary)
+
+    if not found_today:
+        print(f"{BOLD}{YELLOW}No sessions found for today.{RESET}")
+        return
+
+    print(f"{BOLD}{BLUE}--- Daily Accomplishments Report ({now.strftime('%Y-%m-%d')}) ---{RESET}\n")
+
+    for project, summaries in project_summaries.items():
+        print(f"{BOLD}{CYAN}# {project}{RESET}")
+        seen = set()
+        for summ in summaries:
+            if summ in seen: continue
+            seen.add(summ)
+            # Simple deduplication and formatting
+            lines = summ.split('\n')
+            for line in lines:
+                if line.strip():
+                    print(f"  - {line.strip()}")
+        print()
+
 def search_sessions(query):
     all_sessions = get_sessions()
     results = []
@@ -585,9 +709,14 @@ def main():
     parser_stats = subparsers.add_parser("stats", help="Show session statistics")
 
     parser_continue = subparsers.add_parser("continue", help="Resume the most recent session")
+    parser_continue.add_argument("--project", help="Resume the most recent session for a specific project")
 
     parser_search = subparsers.add_parser("search", help="Search session transcripts")
     parser_search.add_argument("query", help="Search term")
+
+    parser_timeline = subparsers.add_parser("timeline", help="Show a chronological timeline of sessions")
+
+    parser_report = subparsers.add_parser("report", help="Show a daily report of accomplishments")
 
     args = parser.parse_args()
 
@@ -622,13 +751,27 @@ def main():
 
     if args.command == "continue":
         sessions = get_sessions()
-        if sessions:
-            selected = sessions[0] # sessions are sorted by updated_at DESC
-            update_session(selected)
-            safe_key = shlex.quote(selected['key'])
-            print(f"cd {safe_key} && kiro-cli chat --resume")
-        else:
+        if not sessions:
             print("No sessions found.", file=sys.stderr)
+            return
+
+        selected = None
+        if args.project:
+            query = args.project.lower()
+            for s in sessions:
+                project_name = os.path.basename(s["key"]).lower()
+                if query in project_name:
+                    selected = s
+                    break
+            if not selected:
+                print(f"No sessions found for project matching '{args.project}'", file=sys.stderr)
+                return
+        else:
+            selected = sessions[0] # sessions are sorted by updated_at DESC
+
+        update_session(selected)
+        safe_key = shlex.quote(selected['key'])
+        print(f"cd {safe_key} && kiro-cli chat --resume")
         return
 
     if args.command == "search":
@@ -642,6 +785,14 @@ def main():
             update_session(selected)
             safe_key = shlex.quote(selected['key'])
             print(f"cd {safe_key} && kiro-cli chat --resume")
+        return
+
+    if args.command == "timeline":
+        show_timeline()
+        return
+
+    if args.command == "report":
+        show_report()
         return
 
     # Interactive picker mode
