@@ -39,6 +39,16 @@ def get_active_sessions():
     """Scan ~/.kiro/sessions/cli for active lock files AND check running processes."""
     active_paths = {}
 
+    # Pre-calculate active kiro-cli PIDs to avoid N calls to 'ps'
+    active_pids = set()
+    try:
+        # Check both kiro-cli and bun (as used in is_process_running)
+        for pattern in ["kiro-cli", "bun"]:
+            out = subprocess.check_output(["pgrep", "-f", pattern], text=True)
+            active_pids.update(int(p) for p in out.strip().split('\n') if p)
+    except Exception:
+        pass
+
     # Method 1: Lock files (most reliable for TUI)
     if os.path.exists(SESSIONS_DIR):
         lock_files = glob.glob(os.path.join(SESSIONS_DIR, "*.lock"))
@@ -48,7 +58,7 @@ def get_active_sessions():
                     lock_data = json.load(f)
                     pid = lock_data.get("pid")
 
-                    if pid and is_process_running(pid):
+                    if pid and pid in active_pids:
                         json_path = lock_path.replace(".lock", ".json")
                         if os.path.exists(json_path):
                             with open(json_path, 'r') as jf:
@@ -59,17 +69,12 @@ def get_active_sessions():
             except Exception:
                 continue
 
-    # Method 2: Fallback for non-interactive/hidden sessions (ps + lsof)
-    try:
-        # Get PIDs of all processes whose command line contains 'kiro-cli'
-        ps_cmd = ["pgrep", "-f", "kiro-cli"]
-        pids = subprocess.check_output(ps_cmd, text=True).strip().split('\n')
+    # Method 2: Fallback for non-interactive/hidden sessions (lsof for remaining PIDs)
+    for pid in active_pids:
+        if pid in active_paths.values():
+            continue # Already found via lock
 
-        for pid_str in pids:
-            if not pid_str: continue
-            pid = int(pid_str)
-            if pid in active_paths.values(): continue # Already found via lock
-
+        try:
             # Use lsof to find the CWD of the process
             lsof_cmd = ["lsof", "-a", "-p", str(pid), "-d", "cwd", "-Fn"]
             lsof_out = subprocess.check_output(lsof_cmd, text=True)
@@ -78,11 +83,59 @@ def get_active_sessions():
                     cwd = line[1:].strip()
                     if cwd and cwd not in active_paths:
                         active_paths[cwd] = pid
-    except Exception:
-        pass # Fallback failed, ignore
+        except Exception:
+            pass
 
     return active_paths
 
+
+def format_session(row, active_map):
+    key, conv_id, value, updated_at, source = row
+    try:
+        data = json.loads(value)
+        transcript = data.get("transcript", [])
+        history = data.get("history", [])
+        model_info = data.get("model_info", {})
+        model = model_info.get("model_id", "auto")
+        msg_count = len(history)
+
+        # Extract first user message for better differentiation
+        preview = ""
+        first_user_msg = ""
+        for line in reversed(transcript):
+            if line.strip():
+                stripped = line.strip()
+                if stripped.startswith("> "):
+                    first_user_msg = stripped[2:].strip().replace("\n", " ")[:120]
+                else:
+                    preview = stripped.replace("\n", " ")[:100]
+                break
+
+        dt = datetime.fromtimestamp(updated_at / 1000) if updated_at > 0 else datetime.now()
+        date_str = dt.strftime("%m-%d %H:%M")
+
+        project = os.path.basename(key)[:20]
+        model_short = model.split(".")[-1][:16] if "." in model else model[:16]
+
+        # Active indicator
+        pid = active_map.get(key)
+        status_icon = f"{GREEN}●{RESET}" if pid else " "
+
+        # 1:icon, 2:proj, 3:date, 4:model, 5:msgs, 6:preview, 7:key, 8:pid, 9:conv_id
+        display = (
+            f"{status_icon}\t"
+            f"{BOLD}{BLUE}{project}{RESET}\t"
+            f"{YELLOW}{date_str}{RESET}\t"
+            f"{CYAN}{model_short}{RESET}\t"
+            f"{MAGENTA}{msg_count}{RESET}\t"
+            f"{first_user_msg if first_user_msg else preview}\t"
+            f"{GREEN}{key}{RESET}\t"
+            f"{pid if pid else ''}\t"
+            f"{conv_id}"
+        )
+        return display, data
+    except Exception:
+        return None, None
 
 def get_sessions():
     if not os.path.exists(DB_PATH):
@@ -109,61 +162,23 @@ def get_sessions():
     
     sessions = []
     for row in rows:
-        key, conv_id, value, updated_at, source = row
-        try:
-            data = json.loads(value)
-            transcript = data.get("transcript", [])
-            history = data.get("history", [])
-            model_info = data.get("model_info", {})
-            model = model_info.get("model_id", "auto")
-            msg_count = len(history)
-            
-            # Extract first user message for better differentiation
-            preview = ""
-            first_user_msg = ""
-            for line in reversed(transcript):
-                if line.strip():
-                    stripped = line.strip()
-                    if stripped.startswith("> "):
-                        first_user_msg = stripped[2:].strip().replace("\n", " ")[:120]
-                    else:
-                        preview = stripped.replace("\n", " ")[:100]
-                    break
-            
-            dt = datetime.fromtimestamp(updated_at / 1000) if updated_at > 0 else datetime.now()
-            date_str = dt.strftime("%Y-%m-%d %H:%M")
-            
-            project = os.path.basename(key)[:20]
-            model_short = model.split(".")[-1][:16] if "." in model else model[:16]
-            date_str = dt.strftime("%m-%d %H:%M")
-
-            # Active indicator
-            pid = active_map.get(key)
-            status_icon = f"{GREEN}●{RESET}" if pid else " "
-
-            # 1:icon, 2:proj, 3:date, 4:model, 5:msgs, 6:preview, 7:key, 8:pid, 9:conv_id
-            display = (
-                f"{status_icon}\t"
-                f"{BOLD}{BLUE}{project}{RESET}\t"
-                f"{YELLOW}{date_str}{RESET}\t"
-                f"{CYAN}{model_short}{RESET}\t"
-                f"{MAGENTA}{msg_count}{RESET}\t"
-                f"{first_user_msg if first_user_msg else preview}\t"
-                f"{GREEN}{key}{RESET}\t"
-                f"{pid if pid else ''}\t"
-                f"{conv_id}"
-            )
-            
-            sessions.append({
-                "key": key,
-                "id": conv_id,
-                "display": display,
-                "source": source,
-                "pid": pid
-            })
-        except Exception:
+        display, data = format_session(row, active_map)
+        if not display:
             continue
             
+        key, conv_id, value, updated_at, source = row
+        pid = active_map.get(key)
+
+        sessions.append({
+            "key": key,
+            "id": conv_id,
+            "display": display,
+            "source": source,
+            "pid": pid,
+            "updated_at": updated_at,
+            "data": data
+        })
+
     return sessions
 
 def is_fzf_tmux_supported():
@@ -256,8 +271,9 @@ def delete_sessions(pairs):
 
         # Remove session files
         if conv_id != "legacy":
+            safe_id = os.path.basename(conv_id)
             for ext in (".json", ".lock"):
-                path = os.path.join(SESSIONS_DIR, conv_id + ext)
+                path = os.path.join(SESSIONS_DIR, safe_id + ext)
                 try:
                     os.remove(path)
                 except OSError:
@@ -418,7 +434,8 @@ def dump_sessions(dest_dir, specific_session_id=None):
             os.makedirs(target_dir, exist_ok=True)
 
             # Markdown file path (flat)
-            file_name = f"{project}_{conv_id}.md"
+            safe_id = os.path.basename(conv_id)
+            file_name = f"{project}_{safe_id}.md"
             file_path = os.path.join(target_dir, file_name)
 
             with open(file_path, "w", encoding="utf-8") as f:
@@ -458,6 +475,119 @@ def dump_sessions(dest_dir, specific_session_id=None):
             continue
 
     print(f"Successfully dumped {dumped_count} sessions.", file=sys.stderr)
+
+def generate_report():
+    sessions = get_sessions()
+    if not sessions:
+        print("No sessions found.")
+        return
+
+    today = datetime.now().date()
+    today_sessions = [s for s in sessions if s.get("updated_at", 0) > 0 and datetime.fromtimestamp(s["updated_at"] / 1000).date() == today]
+
+    if not today_sessions:
+        print(f"{BOLD}{BLUE}No sessions found for today ({today}).{RESET}")
+        return
+
+    print(f"{BOLD}{CYAN}--- DAILY ACCOMPLISHMENTS REPORT ({today}) ---{RESET}\n")
+
+    report_data = {} # project -> set of summaries/previews
+    for s in today_sessions:
+        project = os.path.basename(s['key'])
+        data = s.get("data", {})
+        summary = data.get("latest_summary")
+
+        content = ""
+        if summary:
+            content = summary
+        else:
+            # Fallback to first user message if available
+            transcript = data.get("transcript", [])
+            for line in transcript:
+                if line.strip().startswith("> "):
+                    content = line.strip()[2:].strip()
+                    break
+            if not content and transcript:
+                content = transcript[-1].strip()
+
+        if content:
+            if project not in report_data:
+                report_data[project] = set()
+            report_data[project].add(content)
+
+    for project, items in sorted(report_data.items()):
+        print(f"{BOLD}{BLUE}[{project}]{RESET}")
+        for item in items:
+            # Simple formatting for the report
+            lines = item.split("\n")
+            first_line = lines[0]
+            print(f"  • {first_line}")
+            if len(lines) > 1:
+                print(f"    {DIM}(...){RESET}")
+        print()
+
+def show_timeline():
+    sessions = get_sessions()
+    if not sessions:
+        print("No sessions found.")
+        return
+
+    now = datetime.now()
+    today = now.date()
+    from datetime import timedelta
+    yesterday = today - timedelta(days=1)
+
+    groups = {}
+
+    for s in sessions:
+        updated_at = s.get("updated_at", 0)
+        if updated_at == 0:
+            label = "LEGACY / UNKNOWN"
+        else:
+            dt = datetime.fromtimestamp(updated_at / 1000)
+            session_date = dt.date()
+            if session_date == today:
+                label = "TODAY"
+            elif yesterday and session_date == yesterday:
+                label = "YESTERDAY"
+            else:
+                label = session_date.strftime("%Y-%m-%d")
+
+        if label not in groups:
+            groups[label] = []
+        groups[label].append(s)
+
+    def sort_key(item):
+        label = item[0]
+        if label == "TODAY": return "0"
+        if label == "YESTERDAY": return "1"
+        if label == "LEGACY / UNKNOWN": return "z"
+        # Sort date labels descending (YYYY-MM-DD -> -YYYY-MM-DD for reverse alpha)
+        return "2_" + "".join(chr(255 - ord(c)) for c in label)
+
+    for label, group in sorted(groups.items(), key=sort_key):
+        if not group: continue
+
+        print(f"\n{BOLD}{YELLOW}--- {label} ---{RESET}")
+        for s in group:
+            dt = datetime.fromtimestamp(s['updated_at'] / 1000) if s['updated_at'] > 0 else None
+            time_str = dt.strftime("%H:%M") if dt else "??"
+            project = os.path.basename(s['key'])[:20]
+
+            # Extract snippet
+            data = s.get("data", {})
+            summary = data.get("latest_summary")
+            transcript = data.get("transcript", [])
+            preview = ""
+            if summary:
+                preview = summary[:100]
+            else:
+                for line in reversed(transcript):
+                    if line.strip():
+                        preview = line.strip().replace("\n", " ")[:100]
+                        break
+
+            print(f"  {DIM}{time_str}{RESET} {BOLD}{BLUE}{project:20}{RESET} {preview}")
 
 def show_stats():
     sessions = get_sessions()
@@ -510,37 +640,12 @@ def show_stats():
 def search_sessions(query):
     all_sessions = get_sessions()
     results = []
-
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-
     query_lower = query.lower()
 
-    # Pre-filter using SQL LIKE for efficiency
-    sql_query = """
-    SELECT key, conversation_id FROM conversations_v2 WHERE value LIKE ?
-    UNION ALL
-    SELECT key, 'legacy' FROM conversations WHERE value LIKE ?
-    """
-    cursor.execute(sql_query, (f"%{query}%", f"%{query}%"))
-    matches = set(cursor.fetchall())
-
     for s in all_sessions:
-        if (s["key"], s["id"]) not in matches:
-            continue
-
-        # Get full data to extract snippet
-        if s["id"] == "legacy":
-            cursor.execute("SELECT value FROM conversations WHERE key = ?", (s["key"],))
-        else:
-            cursor.execute("SELECT value FROM conversations_v2 WHERE conversation_id = ? AND key = ?", (s["id"], s["key"]))
-
-        row = cursor.fetchone()
-        if not row: continue
-
-        data = json.loads(row[0])
+        data = s.get("data", {})
         transcript_text = " ".join(data.get("transcript", []))
-        summary_text = data.get("latest_summary", "")
+        summary_text = data.get("latest_summary") or ""
         full_text = transcript_text + " " + summary_text
 
         if query_lower in full_text.lower():
@@ -551,13 +656,13 @@ def search_sessions(query):
             snippet = full_text[start:end].replace("\n", " ")
 
             # Update display to include snippet
+            # display: 1:icon, 2:proj, 3:date, 4:model, 5:msgs, 6:preview, 7:key, 8:pid, 9:conv_id
             parts = s["display"].split('\t')
-            # 1:icon, 2:proj, 3:date, 4:model, 5:msgs, 6:preview, 7:key, 8:pid, 9:conv_id
-            parts[5] = f"{YELLOW}...{snippet}...{RESET}"
-            s["display"] = "\t".join(parts)
+            if len(parts) > 5:
+                parts[5] = f"{YELLOW}...{snippet}...{RESET}"
+                s["display"] = "\t".join(parts)
             results.append(s)
 
-    conn.close()
     return results
 
 def main():
@@ -584,7 +689,12 @@ def main():
 
     parser_stats = subparsers.add_parser("stats", help="Show session statistics")
 
+    parser_timeline = subparsers.add_parser("timeline", help="Show a chronological timeline of sessions")
+
+    parser_report = subparsers.add_parser("report", help="Generate a daily accomplishments report")
+
     parser_continue = subparsers.add_parser("continue", help="Resume the most recent session")
+    parser_continue.add_argument("--project", help="Substring of project path to filter by")
 
     parser_search = subparsers.add_parser("search", help="Search session transcripts")
     parser_search.add_argument("query", help="Search term")
@@ -620,13 +730,34 @@ def main():
         show_stats()
         return
 
+    if args.command == "timeline":
+        show_timeline()
+        return
+
+    if args.command == "report":
+        generate_report()
+        return
+
     if args.command == "continue":
         sessions = get_sessions()
         if sessions:
-            selected = sessions[0] # sessions are sorted by updated_at DESC
-            update_session(selected)
-            safe_key = shlex.quote(selected['key'])
-            print(f"cd {safe_key} && kiro-cli chat --resume")
+            selected = None
+            if args.project:
+                query = args.project.lower()
+                for s in sessions:
+                    if query in os.path.basename(s['key']).lower():
+                        selected = s
+                        break
+            else:
+                selected = sessions[0] # sessions are sorted by updated_at DESC
+
+            if selected:
+                update_session(selected)
+                safe_key = shlex.quote(selected['key'])
+                print(f"cd {safe_key} && kiro-cli chat --resume")
+            else:
+                msg = f"No session found for project '{args.project}'." if args.project else "No sessions found."
+                print(msg, file=sys.stderr)
         else:
             print("No sessions found.", file=sys.stderr)
         return
