@@ -29,6 +29,36 @@ You can optionally dump a single specific session by passing its ID:
 kiro-sessionizer backup /path/to/destination/dir --session-id "my_session_id"
 ```
 
+### Viewing Timeline
+
+See a chronological history of your sessions grouped by date:
+
+```sh
+kiro-sessionizer timeline
+```
+
+### Daily Accomplishments Report
+
+Generate a summary of work completed today, grouped by project. This uses session summaries to provide a high-level overview:
+
+```sh
+kiro-sessionizer report
+```
+
+### Resuming the Latest Session
+
+Quickly resume the most recently active session:
+
+```sh
+kiro-sessionizer continue
+```
+
+Or resume the latest session for a specific project:
+
+```sh
+kiro-sessionizer continue --project my-web-app
+```
+
 ## Installation
 
 ```sh

@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
-import sqlite3
+import argparse
+import glob
 import json
 import os
-import sys
-import subprocess
-from datetime import datetime
 import re
-import glob
+import shlex
+import sqlite3
+import subprocess
+import sys
+from datetime import datetime, timedelta
 
 DB_PATH = os.environ.get("KIRO_DB_PATH") or os.path.expanduser("~/Library/Application Support/kiro-cli/data.sqlite3")
 SESSIONS_DIR = os.environ.get("KIRO_SESSIONS_DIR") or os.path.expanduser("~/.kiro/sessions/cli")
@@ -159,7 +161,9 @@ def get_sessions():
                 "id": conv_id,
                 "display": display,
                 "source": source,
-                "pid": pid
+                "pid": pid,
+                "data": data,
+                "updated_at": updated_at
             })
         except Exception:
             continue
@@ -470,31 +474,17 @@ def show_stats():
     projects = {}
     total_msgs = 0
 
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-
-    query = "SELECT value FROM conversations_v2 UNION ALL SELECT value FROM conversations"
-    cursor.execute(query)
-    for row in cursor.fetchall():
-        try:
-            data = json.loads(row[0])
-            model = data.get("model_info", {}).get("model_id", "unknown")
-            models[model] = models.get(model, 0) + 1
-
-            key = "unknown"
-            # We don't have the key directly here easily without more complex query but we can infer from sessions
-        except: continue
-    conn.close()
-
     for s in sessions:
+        data = s.get("data", {})
+        model_info = data.get("model_info", {})
+        model = model_info.get("model_id", "unknown")
+        models[model] = models.get(model, 0) + 1
+
         project = os.path.basename(s["key"])
         projects[project] = projects.get(project, 0) + 1
 
-        # Extract message count from display (it's the 5th tab-separated field)
-        try:
-            parts = strip_ansi(s["display"]).split('\t')
-            total_msgs += int(parts[4])
-        except: pass
+        history = data.get("history", [])
+        total_msgs += len(history)
 
     print(f"{BOLD}{BLUE}--- Kiro Sessionizer Statistics ---{RESET}")
     print(f"{BOLD}Total Sessions:{RESET}  {total}")
@@ -506,6 +496,112 @@ def show_stats():
     print(f"\n{BOLD}Model Usage:{RESET}")
     for m, count in sorted(models.items(), key=lambda x: x[1], reverse=True):
         print(f"  {m:20} {count} sessions")
+
+def show_timeline():
+    sessions = get_sessions()
+    if not sessions:
+        print("No sessions found.")
+        return
+
+    print(f"{BOLD}{BLUE}--- Kiro Session Timeline ---{RESET}\n")
+
+    groups = {}
+    now = datetime.now()
+    today = now.date()
+    yesterday = today - timedelta(days=1)
+
+    for s in sessions:
+        dt = datetime.fromtimestamp(s["updated_at"] / 1000) if s["updated_at"] > 0 else None
+        if not dt:
+            day_key = "LEGACY / UNKNOWN"
+        elif dt.date() == today:
+            day_key = "TODAY"
+        elif dt.date() == yesterday:
+            day_key = "YESTERDAY"
+        else:
+            day_key = dt.strftime("%Y-%m-%d")
+
+        if day_key not in groups:
+            groups[day_key] = []
+        groups[day_key].append(s)
+
+    # Chronological sort order: TODAY first, then YESTERDAY, then dates descending, then LEGACY
+    today_group = ["TODAY"] if "TODAY" in groups else []
+    yesterday_group = ["YESTERDAY"] if "YESTERDAY" in groups else []
+    legacy_group = ["LEGACY / UNKNOWN"] if "LEGACY / UNKNOWN" in groups else []
+    date_groups = sorted([k for k in groups.keys() if k not in ["TODAY", "YESTERDAY", "LEGACY / UNKNOWN"]], reverse=True)
+
+    sorted_keys = today_group + yesterday_group + date_groups + legacy_group
+
+    for day in sorted_keys:
+        print(f"{BOLD}{YELLOW}[ {day} ]{RESET}")
+        for s in groups[day]:
+            dt = datetime.fromtimestamp(s["updated_at"] / 1000) if s["updated_at"] > 0 else None
+            time_str = dt.strftime("%H:%M") if dt else "??:??"
+            project = os.path.basename(s["key"])
+
+            data = s.get("data", {})
+            summary = data.get("latest_summary")
+            transcript = data.get("transcript", [])
+
+            preview = ""
+            if summary:
+                preview = summary[:80]
+            else:
+                for line in reversed(transcript):
+                    if line.strip() and line.strip().startswith("> "):
+                        preview = line.strip()[2:].strip()[:80]
+                        break
+
+            print(f"  {DIM}{time_str}{RESET}  {BOLD}{BLUE}{project:15}{RESET}  {preview}")
+        print()
+
+def generate_report():
+    sessions = get_sessions()
+    if not sessions:
+        print("No sessions found.")
+        return
+
+    now = datetime.now()
+    today = now.date()
+
+    today_sessions = [s for s in sessions if s["updated_at"] > 0 and datetime.fromtimestamp(s["updated_at"] / 1000).date() == today]
+
+    if not today_sessions:
+        print("No activity recorded for today.")
+        return
+
+    print(f"{BOLD}{BLUE}--- Kiro Daily Accomplishments Report ({today.strftime('%Y-%m-%d')}) ---{RESET}\n")
+
+    project_work = {}
+    for s in today_sessions:
+        project = os.path.basename(s["key"])
+        if project not in project_work:
+            project_work[project] = []
+
+        data = s.get("data", {})
+        summary = data.get("latest_summary")
+        transcript = data.get("transcript", [])
+
+        item = summary if summary else ""
+        if not item:
+            for line in reversed(transcript):
+                if line.strip() and line.strip().startswith("> "):
+                    item = line.strip()[2:].strip()
+                    break
+
+        if item and item not in project_work[project]:
+            project_work[project].append(item)
+
+    for project, items in sorted(project_work.items()):
+        print(f"{BOLD}{CYAN}# {project}{RESET}")
+        for item in items:
+            # Bullet point if multiline, otherwise just print
+            if "\n" in item:
+                indented = "\n".join([f"  {line}" for line in item.split("\n")])
+                print(f"{indented}\n")
+            else:
+                print(f"  • {item}\n")
 
 def search_sessions(query):
     all_sessions = get_sessions()
@@ -584,7 +680,12 @@ def main():
 
     parser_stats = subparsers.add_parser("stats", help="Show session statistics")
 
+    parser_timeline = subparsers.add_parser("timeline", help="Show chronological session history")
+
+    parser_report = subparsers.add_parser("report", help="Generate daily accomplishments report")
+
     parser_continue = subparsers.add_parser("continue", help="Resume the most recent session")
+    parser_continue.add_argument("--project", help="Filter by project name substring")
 
     parser_search = subparsers.add_parser("search", help="Search session transcripts")
     parser_search.add_argument("query", help="Search term")
@@ -620,15 +721,27 @@ def main():
         show_stats()
         return
 
+    if args.command == "timeline":
+        show_timeline()
+        return
+
+    if args.command == "report":
+        generate_report()
+        return
+
     if args.command == "continue":
         sessions = get_sessions()
+        if args.project:
+            sessions = [s for s in sessions if args.project.lower() in s["key"].lower()]
+
         if sessions:
             selected = sessions[0] # sessions are sorted by updated_at DESC
             update_session(selected)
             safe_key = shlex.quote(selected['key'])
             print(f"cd {safe_key} && kiro-cli chat --resume")
         else:
-            print("No sessions found.", file=sys.stderr)
+            msg = f"No sessions found for project matching '{args.project}'." if args.project else "No sessions found."
+            print(msg, file=sys.stderr)
         return
 
     if args.command == "search":
