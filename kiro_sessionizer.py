@@ -4,7 +4,7 @@ import json
 import os
 import sys
 import subprocess
-from datetime import datetime
+from datetime import datetime, timedelta
 import re
 import glob
 
@@ -118,16 +118,22 @@ def get_sessions():
             model = model_info.get("model_id", "auto")
             msg_count = len(history)
             
-            # Extract first user message for better differentiation
+            # Extract user message and assistant message for preview
+            # We prefer the last ones that aren't trivial, or fallback to the most recent ones.
             preview = ""
-            first_user_msg = ""
+            last_user_msg = ""
             for line in reversed(transcript):
-                if line.strip():
-                    stripped = line.strip()
-                    if stripped.startswith("> "):
-                        first_user_msg = stripped[2:].strip().replace("\n", " ")[:120]
-                    else:
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                if stripped.startswith("> "):
+                    if not last_user_msg:
+                        last_user_msg = stripped[2:].strip().replace("\n", " ")[:120]
+                else:
+                    if not preview:
                         preview = stripped.replace("\n", " ")[:100]
+
+                if last_user_msg and preview:
                     break
             
             dt = datetime.fromtimestamp(updated_at / 1000) if updated_at > 0 else datetime.now()
@@ -148,7 +154,7 @@ def get_sessions():
                 f"{YELLOW}{date_str}{RESET}\t"
                 f"{CYAN}{model_short}{RESET}\t"
                 f"{MAGENTA}{msg_count}{RESET}\t"
-                f"{first_user_msg if first_user_msg else preview}\t"
+                f"{last_user_msg if last_user_msg else preview}\t"
                 f"{GREEN}{key}{RESET}\t"
                 f"{pid if pid else ''}\t"
                 f"{conv_id}"
@@ -159,7 +165,10 @@ def get_sessions():
                 "id": conv_id,
                 "display": display,
                 "source": source,
-                "pid": pid
+                "pid": pid,
+                "updated_at": updated_at,
+                "data": data,
+                "last_user_msg": last_user_msg
             })
         except Exception:
             continue
@@ -507,6 +516,117 @@ def show_stats():
     for m, count in sorted(models.items(), key=lambda x: x[1], reverse=True):
         print(f"  {m:20} {count} sessions")
 
+def show_timeline():
+    sessions = get_sessions()
+    if not sessions:
+        print("No sessions found.")
+        return
+
+    now = datetime.now()
+    today = now.date()
+    yesterday = today - timedelta(days=1)
+
+    groups = {} # date_str -> list of sessions
+
+    for s in sessions:
+        updated_at = s["updated_at"]
+        if updated_at == 0:
+            date_label = "LEGACY / UNKNOWN"
+        else:
+            dt = datetime.fromtimestamp(updated_at / 1000)
+            session_date = dt.date()
+            if session_date == today:
+                date_label = "TODAY"
+            elif session_date == yesterday:
+                date_label = "YESTERDAY"
+            else:
+                date_label = dt.strftime("%Y-%m-%d")
+
+        if date_label not in groups:
+            groups[date_label] = []
+        groups[date_label].append(s)
+
+    date_labels = [l for l in groups.keys() if l not in ["TODAY", "YESTERDAY", "LEGACY / UNKNOWN"]]
+    date_labels.sort(reverse=True)
+
+    final_labels = []
+    if "TODAY" in groups: final_labels.append("TODAY")
+    if "YESTERDAY" in groups: final_labels.append("YESTERDAY")
+    final_labels.extend(date_labels)
+    if "LEGACY / UNKNOWN" in groups: final_labels.append("LEGACY / UNKNOWN")
+
+    for label in final_labels:
+        print(f"\n{BOLD}{YELLOW}--- {label} ---{RESET}")
+        for s in groups[label]:
+            project = os.path.basename(s["key"])
+            data = s["data"]
+            summary = data.get("latest_summary")
+            msg = s["last_user_msg"]
+            snippet = summary if summary else msg
+            if not snippet:
+                transcript = data.get("transcript", [])
+                if transcript:
+                    snippet = transcript[-1].replace("\n", " ")[:100]
+
+            if snippet:
+                snippet = (snippet[:100] + "...") if len(snippet) > 100 else snippet
+            else:
+                snippet = "(no content)"
+
+            time_str = ""
+            if s["updated_at"] > 0:
+                dt = datetime.fromtimestamp(s["updated_at"] / 1000)
+                time_str = dt.strftime("%H:%M")
+
+            status = f"{GREEN}●{RESET} " if s["pid"] else "  "
+            print(f"{status}{BOLD}{BLUE}{project:20}{RESET} {DIM}{time_str}{RESET}  {snippet}")
+
+def generate_report():
+    sessions = get_sessions()
+    if not sessions:
+        print("No sessions found.")
+        return
+
+    today = datetime.now().date()
+    today_sessions = [s for s in sessions if s["updated_at"] > 0 and datetime.fromtimestamp(s["updated_at"] / 1000).date() == today]
+
+    if not today_sessions:
+        print(f"No sessions found for today ({today}).")
+        return
+
+    print(f"{BOLD}{GREEN}--- Daily Accomplishments Report ({today}) ---{RESET}\n")
+
+    projects = {}
+    for s in today_sessions:
+        proj = os.path.basename(s["key"])
+        if proj not in projects:
+            projects[proj] = []
+
+        data = s["data"]
+        summary = data.get("latest_summary")
+        msg = s["last_user_msg"]
+
+        entry = summary if summary else msg
+        if not entry:
+            transcript = data.get("transcript", [])
+            if transcript:
+                entry = transcript[-1].replace("\n", " ")[:150]
+
+        if entry:
+            projects[proj].append(entry)
+
+    for proj, entries in projects.items():
+        print(f"{BOLD}{BLUE}Project: {proj}{RESET}")
+        # Use a set to deduplicate entries if multiple sessions have the same summary/msg
+        unique_entries = list(dict.fromkeys(entries))
+        for entry in unique_entries:
+            # Simple formatting for multi-line summaries
+            lines = entry.strip().split("\n")
+            for i, line in enumerate(lines):
+                prefix = "  - " if i == 0 else "    "
+                print(f"{prefix}{line}")
+        print()
+
 def search_sessions(query):
     all_sessions = get_sessions()
     results = []
@@ -585,9 +705,14 @@ def main():
     parser_stats = subparsers.add_parser("stats", help="Show session statistics")
 
     parser_continue = subparsers.add_parser("continue", help="Resume the most recent session")
+    parser_continue.add_argument("--project", help="Resume the most recent session for a specific project")
 
     parser_search = subparsers.add_parser("search", help="Search session transcripts")
     parser_search.add_argument("query", help="Search term")
+
+    parser_timeline = subparsers.add_parser("timeline", help="Show chronological session history")
+
+    parser_report = subparsers.add_parser("report", help="Generate a daily accomplishments report")
 
     args = parser.parse_args()
 
@@ -620,15 +745,37 @@ def main():
         show_stats()
         return
 
+    if args.command == "timeline":
+        show_timeline()
+        return
+
+    if args.command == "report":
+        generate_report()
+        return
+
     if args.command == "continue":
         sessions = get_sessions()
-        if sessions:
+        if not sessions:
+            print("No sessions found.", file=sys.stderr)
+            return
+
+        selected = None
+        if args.project:
+            query = args.project.lower()
+            for s in sessions:
+                if query in s["key"].lower():
+                    selected = s
+                    break
+            if not selected:
+                print(f"No sessions found for project matching '{args.project}'.", file=sys.stderr)
+                return
+        else:
             selected = sessions[0] # sessions are sorted by updated_at DESC
+
+        if selected:
             update_session(selected)
             safe_key = shlex.quote(selected['key'])
             print(f"cd {safe_key} && kiro-cli chat --resume")
-        else:
-            print("No sessions found.", file=sys.stderr)
         return
 
     if args.command == "search":
