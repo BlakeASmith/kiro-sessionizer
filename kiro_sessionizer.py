@@ -4,7 +4,7 @@ import json
 import os
 import sys
 import subprocess
-from datetime import datetime
+from datetime import datetime, timedelta
 import re
 import glob
 
@@ -23,21 +23,28 @@ DIM = "\033[2m"
 ITALIC = "\033[3m"
 RESET = "\033[0m"
 
-def strip_ansi(text):
-    return re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])').sub('', text)
+ANSI_ESCAPE = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
 
-def is_process_running(pid):
-    """Check if a process with the given PID is running and is a kiro-cli process."""
+def strip_ansi(text):
+    return ANSI_ESCAPE.sub('', text)
+
+def get_running_pids():
+    """Get a set of PIDs that are kiro-cli or bun processes."""
+    running_pids = set()
     try:
-        os.kill(pid, 0)
-        cmd = ["ps", "-p", str(pid), "-o", "command="]
-        output = subprocess.check_output(cmd, stderr=subprocess.STDOUT, text=True)
-        return "kiro-cli" in output or "bun" in output
-    except (OSError, subprocess.CalledProcessError):
-        return False
+        # Get PIDs of all processes whose command line contains 'kiro-cli' or 'bun'
+        ps_cmd = ["pgrep", "-f", "kiro-cli|bun"]
+        output = subprocess.check_output(ps_cmd, text=True).strip()
+        if output:
+            running_pids = set(int(pid) for pid in output.split('\n'))
+    except Exception:
+        pass
+    return running_pids
+
 def get_active_sessions():
     """Scan ~/.kiro/sessions/cli for active lock files AND check running processes."""
     active_paths = {}
+    running_pids = get_running_pids()
 
     # Method 1: Lock files (most reliable for TUI)
     if os.path.exists(SESSIONS_DIR):
@@ -48,7 +55,7 @@ def get_active_sessions():
                     lock_data = json.load(f)
                     pid = lock_data.get("pid")
 
-                    if pid and is_process_running(pid):
+                    if pid and pid in running_pids:
                         json_path = lock_path.replace(".lock", ".json")
                         if os.path.exists(json_path):
                             with open(json_path, 'r') as jf:
@@ -60,16 +67,10 @@ def get_active_sessions():
                 continue
 
     # Method 2: Fallback for non-interactive/hidden sessions (ps + lsof)
-    try:
-        # Get PIDs of all processes whose command line contains 'kiro-cli'
-        ps_cmd = ["pgrep", "-f", "kiro-cli"]
-        pids = subprocess.check_output(ps_cmd, text=True).strip().split('\n')
+    for pid in running_pids:
+        if pid in active_paths.values(): continue # Already found via lock
 
-        for pid_str in pids:
-            if not pid_str: continue
-            pid = int(pid_str)
-            if pid in active_paths.values(): continue # Already found via lock
-
+        try:
             # Use lsof to find the CWD of the process
             lsof_cmd = ["lsof", "-a", "-p", str(pid), "-d", "cwd", "-Fn"]
             lsof_out = subprocess.check_output(lsof_cmd, text=True)
@@ -78,8 +79,8 @@ def get_active_sessions():
                     cwd = line[1:].strip()
                     if cwd and cwd not in active_paths:
                         active_paths[cwd] = pid
-    except Exception:
-        pass # Fallback failed, ignore
+        except Exception:
+            pass # Fallback failed, ignore
 
     return active_paths
 
@@ -118,16 +119,18 @@ def get_sessions():
             model = model_info.get("model_id", "auto")
             msg_count = len(history)
             
-            # Extract first user message for better differentiation
+            # Extract last user message for better differentiation
             preview = ""
-            first_user_msg = ""
+            last_user_msg = ""
             for line in reversed(transcript):
-                if line.strip():
-                    stripped = line.strip()
-                    if stripped.startswith("> "):
-                        first_user_msg = stripped[2:].strip().replace("\n", " ")[:120]
-                    else:
-                        preview = stripped.replace("\n", " ")[:100]
+                stripped = line.strip()
+                if not stripped: continue
+
+                if not preview:
+                    preview = stripped.replace("\n", " ")[:100]
+
+                if stripped.startswith("> "):
+                    last_user_msg = stripped[2:].strip().replace("\n", " ")[:120]
                     break
             
             dt = datetime.fromtimestamp(updated_at / 1000) if updated_at > 0 else datetime.now()
@@ -148,7 +151,7 @@ def get_sessions():
                 f"{YELLOW}{date_str}{RESET}\t"
                 f"{CYAN}{model_short}{RESET}\t"
                 f"{MAGENTA}{msg_count}{RESET}\t"
-                f"{first_user_msg if first_user_msg else preview}\t"
+                f"{last_user_msg if last_user_msg else preview}\t"
                 f"{GREEN}{key}{RESET}\t"
                 f"{pid if pid else ''}\t"
                 f"{conv_id}"
@@ -159,7 +162,10 @@ def get_sessions():
                 "id": conv_id,
                 "display": display,
                 "source": source,
-                "pid": pid
+                "pid": pid,
+                "updated_at": updated_at,
+                "data": data,
+                "last_user_msg": last_user_msg
             })
         except Exception:
             continue
@@ -175,8 +181,38 @@ def is_fzf_tmux_supported():
     except Exception:
         return False
 
+def start_new_session():
+    """Trigger agent selection and start a new session."""
+    try:
+        # Get list of agents from kiro-cli
+        result = subprocess.run(["kiro-cli", "agent", "list"], capture_output=True, text=True)
+        if result.returncode != 0:
+             print(f"Error listing agents: {result.stderr}", file=sys.stderr)
+             return
+
+        agents = [line.strip() for line in result.stdout.split('\n') if line.strip()]
+        if not agents:
+            print("No agents found.", file=sys.stderr)
+            return
+
+        # Use fzf to select an agent
+        fzf_cmd = ["fzf", "--header", "Select an Agent for the New Session", "--height", "40%", "--reverse"]
+        if is_fzf_tmux_supported():
+            fzf_cmd.append("--tmux")
+
+        fzf_proc = subprocess.Popen(fzf_cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+        stdout, _ = fzf_proc.communicate(input="\n".join(agents))
+
+        if fzf_proc.returncode == 0 and stdout:
+            agent = stdout.strip()
+            print(f"kiro-cli chat --agent {agent}")
+    except FileNotFoundError:
+        print("Error: 'kiro-cli' or 'fzf' not found.", file=sys.stderr)
+
 def select_session(sessions):
-    fzf_input = "\n".join([s["display"] for s in sessions])
+    # Add virtual entry for new session
+    new_session_display = f"{GREEN}✚{RESET}\t{BOLD}{GREEN}NEW SESSION{RESET}\t\t\t\tStart a fresh session in CWD\t\t\t"
+    fzf_input = new_session_display + "\n" + "\n".join([s["display"] for s in sessions])
     
     fzf_cmd = ["fzf"]
     if is_fzf_tmux_supported():
@@ -221,6 +257,9 @@ def select_session(sessions):
         selected_display = selected_lines[0]
         stripped_selected = strip_ansi(selected_display)
         
+        if "NEW SESSION" in stripped_selected:
+            return {"type": "new"}
+
         for s in sessions:
             if strip_ansi(s["display"]) == stripped_selected:
                 return s
@@ -459,6 +498,86 @@ def dump_sessions(dest_dir, specific_session_id=None):
 
     print(f"Successfully dumped {dumped_count} sessions.", file=sys.stderr)
 
+def generate_report():
+    sessions = get_sessions()
+    if not sessions:
+        print("No sessions found.")
+        return
+
+    today = datetime.now().date()
+    today_sessions = [s for s in sessions if s["updated_at"] > 0 and datetime.fromtimestamp(s["updated_at"] / 1000).date() == today]
+
+    if not today_sessions:
+        print("No activity recorded today.")
+        return
+
+    projects = {}
+    for s in today_sessions:
+        project = os.path.basename(s["key"])
+        if project not in projects:
+            projects[project] = []
+
+        summary = s["data"].get("latest_summary") or s["last_user_msg"]
+        if summary:
+            projects[project].append(summary)
+
+    print(f"{BOLD}{GREEN}--- Daily Activity Report ({today}) ---{RESET}\n")
+    for project, summaries in projects.items():
+        print(f"{BOLD}{BLUE}# {project}{RESET}")
+        for summary in reversed(summaries): # Show in chronological order within project
+            print(f"  - {summary}")
+        print()
+
+def show_timeline():
+    sessions = get_sessions()
+    if not sessions:
+        print("No sessions found.")
+        return
+
+    groups = {}
+    today = datetime.now().date()
+    yesterday = today - timedelta(days=1)
+
+    for s in sessions:
+        updated_at = s["updated_at"]
+        if updated_at == 0:
+            group_name = "LEGACY / UNKNOWN"
+        else:
+            dt = datetime.fromtimestamp(updated_at / 1000).date()
+            if dt == today:
+                group_name = "TODAY"
+            elif dt == yesterday:
+                group_name = "YESTERDAY"
+            else:
+                group_name = dt.strftime("%Y-%m-%d")
+
+        if group_name not in groups:
+            groups[group_name] = []
+        groups[group_name].append(s)
+
+    # Sort groups: TODAY, YESTERDAY, then dates descending, then LEGACY
+    other_dates = sorted([g for g in groups.keys() if g not in ["TODAY", "YESTERDAY", "LEGACY / UNKNOWN"]], reverse=True)
+    final_order = []
+    if "TODAY" in groups: final_order.append("TODAY")
+    if "YESTERDAY" in groups: final_order.append("YESTERDAY")
+    final_order.extend(other_dates)
+    if "LEGACY / UNKNOWN" in groups: final_order.append("LEGACY / UNKNOWN")
+
+    print(f"{BOLD}{BLUE}--- Kiro Session Timeline ---{RESET}\n")
+
+    for group_name in final_order:
+        print(f"{BOLD}{YELLOW}== {group_name} =={RESET}")
+        for s in groups[group_name]:
+            project = os.path.basename(s["key"])
+            summary = s["data"].get("latest_summary") or s["last_user_msg"] or "No summary available"
+            time_str = ""
+            if s["updated_at"] > 0:
+                 time_str = datetime.fromtimestamp(s["updated_at"] / 1000).strftime("%H:%M")
+                 time_str = f"{DIM}[{time_str}]{RESET} "
+
+            print(f"  {time_str}{BOLD}{CYAN}{project}{RESET}: {summary}")
+        print()
+
 def show_stats():
     sessions = get_sessions()
     if not sessions:
@@ -584,7 +703,14 @@ def main():
 
     parser_stats = subparsers.add_parser("stats", help="Show session statistics")
 
+    subparsers.add_parser("new", help="Start a new session with agent selection")
+
+    subparsers.add_parser("timeline", help="Show chronological session history")
+
+    subparsers.add_parser("report", help="Generate a daily accomplishments report")
+
     parser_continue = subparsers.add_parser("continue", help="Resume the most recent session")
+    parser_continue.add_argument("--project", help="Resume most recent session for a project matching this query")
 
     parser_search = subparsers.add_parser("search", help="Search session transcripts")
     parser_search.add_argument("query", help="Search term")
@@ -620,15 +746,31 @@ def main():
         show_stats()
         return
 
+    if args.command == "new":
+        start_new_session()
+        return
+
+    if args.command == "timeline":
+        show_timeline()
+        return
+
+    if args.command == "report":
+        generate_report()
+        return
+
     if args.command == "continue":
         sessions = get_sessions()
+        if args.project:
+            query = args.project.lower()
+            sessions = [s for s in sessions if query in os.path.basename(s["key"]).lower()]
+
         if sessions:
             selected = sessions[0] # sessions are sorted by updated_at DESC
             update_session(selected)
             safe_key = shlex.quote(selected['key'])
             print(f"cd {safe_key} && kiro-cli chat --resume")
         else:
-            print("No sessions found.", file=sys.stderr)
+            print(f"No sessions found{' for project matching ' + args.project if args.project else ''}.", file=sys.stderr)
         return
 
     if args.command == "search":
@@ -652,6 +794,10 @@ def main():
 
     selected = select_session(sessions)
     if selected:
+        if selected.get("type") == "new":
+            start_new_session()
+            return
+
         if selected["pid"]:
             print(f"\n{BOLD}{YELLOW}Notice: Session is active (PID {selected['pid']}).{RESET}", file=sys.stderr)
             print(f"{DIM}Attempting to resume...{RESET}\n", file=sys.stderr)
