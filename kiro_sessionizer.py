@@ -4,7 +4,7 @@ import json
 import os
 import sys
 import subprocess
-from datetime import datetime
+from datetime import datetime, timedelta
 import re
 import glob
 
@@ -159,7 +159,9 @@ def get_sessions():
                 "id": conv_id,
                 "display": display,
                 "source": source,
-                "pid": pid
+                "pid": pid,
+                "updated_at": updated_at,
+                "data": data
             })
         except Exception:
             continue
@@ -459,6 +461,121 @@ def dump_sessions(dest_dir, specific_session_id=None):
 
     print(f"Successfully dumped {dumped_count} sessions.", file=sys.stderr)
 
+def show_timeline():
+    sessions = get_sessions()
+    if not sessions:
+        print("No sessions found.")
+        return
+
+    now = datetime.now()
+    today = now.date()
+    yesterday = today - timedelta(days=1)
+
+    groups = {
+        "TODAY": [],
+        "YESTERDAY": [],
+        "OLDER": {},
+        "LEGACY / UNKNOWN": []
+    }
+
+    for s in sessions:
+        if s["updated_at"] == 0:
+            groups["LEGACY / UNKNOWN"].append(s)
+            continue
+
+        dt = datetime.fromtimestamp(s["updated_at"] / 1000)
+        date = dt.date()
+
+        if date == today:
+            groups["TODAY"].append(s)
+        elif date == yesterday:
+            groups["YESTERDAY"].append(s)
+        else:
+            date_str = date.strftime("%Y-%m-%d")
+            if date_str not in groups["OLDER"]:
+                groups["OLDER"][date_str] = []
+            groups["OLDER"][date_str].append(s)
+
+    def print_session(s):
+        project = os.path.basename(s["key"])
+        dt = datetime.fromtimestamp(s["updated_at"] / 1000) if s["updated_at"] > 0 else None
+        time_str = dt.strftime("%H:%M") if dt else "??:??"
+
+        data = s["data"]
+        summary = data.get("latest_summary")
+        transcript = data.get("transcript", [])
+
+        last_msg = ""
+        if summary:
+            last_msg = summary[:100].replace("\n", " ")
+        else:
+            for line in reversed(transcript):
+                if line.strip():
+                    last_msg = line.strip().replace("\n", " ")[:100]
+                    if last_msg.startswith("> "):
+                        last_msg = last_msg[2:].strip()
+                    break
+
+        print(f"  {DIM}{time_str}{RESET} {BOLD}{BLUE}{project:15}{RESET} {last_msg}")
+
+    for group_name in ["TODAY", "YESTERDAY"]:
+        if groups[group_name]:
+            print(f"\n{BOLD}{YELLOW}--- {group_name} ---{RESET}")
+            for s in groups[group_name]:
+                print_session(s)
+
+    for date_str in sorted(groups["OLDER"].keys(), reverse=True):
+        print(f"\n{BOLD}{YELLOW}--- {date_str} ---{RESET}")
+        for s in groups["OLDER"][date_str]:
+            print_session(s)
+
+    if groups["LEGACY / UNKNOWN"]:
+        print(f"\n{BOLD}{YELLOW}--- LEGACY / UNKNOWN ---{RESET}")
+        for s in groups["LEGACY / UNKNOWN"]:
+            print_session(s)
+    print()
+
+def generate_report():
+    sessions = get_sessions()
+    if not sessions:
+        print("No sessions found.")
+        return
+
+    today = datetime.now().date()
+    today_sessions = [s for s in sessions if s["updated_at"] > 0 and datetime.fromtimestamp(s["updated_at"] / 1000).date() == today]
+
+    if not today_sessions:
+        print(f"No sessions found for today ({today}).")
+        return
+
+    print(f"# Daily Activity Report - {today}\n")
+
+    # Group by project
+    projects = {}
+    for s in today_sessions:
+        project = os.path.basename(s["key"])
+        if project not in projects:
+            projects[project] = []
+        projects[project].append(s)
+
+    for project, p_sessions in projects.items():
+        print(f"## {project}")
+        for s in p_sessions:
+            data = s["data"]
+            summary = data.get("latest_summary")
+
+            if not summary:
+                # Fallback to last user message
+                transcript = data.get("transcript", [])
+                for line in reversed(transcript):
+                    if line.strip().startswith("> "):
+                        summary = line.strip()[2:].strip()
+                        break
+
+            if summary:
+                print(f"- {summary}")
+        print()
+
 def show_stats():
     sessions = get_sessions()
     if not sessions:
@@ -584,7 +701,12 @@ def main():
 
     parser_stats = subparsers.add_parser("stats", help="Show session statistics")
 
+    parser_timeline = subparsers.add_parser("timeline", help="Show chronological session timeline")
+
+    parser_report = subparsers.add_parser("report", help="Generate a daily activity report")
+
     parser_continue = subparsers.add_parser("continue", help="Resume the most recent session")
+    parser_continue.add_argument("--project", help="Resume the most recent session for a specific project")
 
     parser_search = subparsers.add_parser("search", help="Search session transcripts")
     parser_search.add_argument("query", help="Search term")
@@ -620,8 +742,19 @@ def main():
         show_stats()
         return
 
+    if args.command == "timeline":
+        show_timeline()
+        return
+
+    if args.command == "report":
+        generate_report()
+        return
+
     if args.command == "continue":
         sessions = get_sessions()
+        if args.project:
+            sessions = [s for s in sessions if args.project.lower() in os.path.basename(s["key"]).lower()]
+
         if sessions:
             selected = sessions[0] # sessions are sorted by updated_at DESC
             update_session(selected)
