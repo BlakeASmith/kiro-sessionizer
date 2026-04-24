@@ -118,24 +118,24 @@ def get_sessions():
             model = model_info.get("model_id", "auto")
             msg_count = len(history)
             
-            # Extract first user message for better differentiation
+            # Extract metadata for richer features
             preview = ""
-            first_user_msg = ""
+            last_user_msg = ""
             for line in reversed(transcript):
-                if line.strip():
-                    stripped = line.strip()
-                    if stripped.startswith("> "):
-                        first_user_msg = stripped[2:].strip().replace("\n", " ")[:120]
-                    else:
-                        preview = stripped.replace("\n", " ")[:100]
-                    break
+                stripped = line.strip()
+                if not stripped: continue
+
+                if stripped.startswith("> ") and not last_user_msg:
+                    last_user_msg = stripped[2:].strip().replace("\n", " ")[:150]
+                elif not stripped.startswith("> ") and not preview:
+                    preview = stripped.replace("\n", " ")[:150]
+
+                if last_user_msg and preview: break
             
             dt = datetime.fromtimestamp(updated_at / 1000) if updated_at > 0 else datetime.now()
-            date_str = dt.strftime("%Y-%m-%d %H:%M")
-            
-            project = os.path.basename(key)[:20]
+            project = os.path.basename(key.rstrip(os.sep))
             model_short = model.split(".")[-1][:16] if "." in model else model[:16]
-            date_str = dt.strftime("%m-%d %H:%M")
+            date_display = dt.strftime("%m-%d %H:%M") if updated_at > 0 else "LEGACY"
 
             # Active indicator
             pid = active_map.get(key)
@@ -144,11 +144,11 @@ def get_sessions():
             # 1:icon, 2:proj, 3:date, 4:model, 5:msgs, 6:preview, 7:key, 8:pid, 9:conv_id
             display = (
                 f"{status_icon}\t"
-                f"{BOLD}{BLUE}{project}{RESET}\t"
-                f"{YELLOW}{date_str}{RESET}\t"
+                f"{BOLD}{BLUE}{project[:20]}{RESET}\t"
+                f"{YELLOW}{date_display}{RESET}\t"
                 f"{CYAN}{model_short}{RESET}\t"
                 f"{MAGENTA}{msg_count}{RESET}\t"
-                f"{first_user_msg if first_user_msg else preview}\t"
+                f"{last_user_msg if last_user_msg else preview}\t"
                 f"{GREEN}{key}{RESET}\t"
                 f"{pid if pid else ''}\t"
                 f"{conv_id}"
@@ -159,7 +159,14 @@ def get_sessions():
                 "id": conv_id,
                 "display": display,
                 "source": source,
-                "pid": pid
+                "pid": pid,
+                "updated_at": updated_at,
+                "data": data,
+                "last_user_msg": last_user_msg,
+                "preview": preview,
+                "msg_count": msg_count,
+                "model": model,
+                "project": project
             })
         except Exception:
             continue
@@ -175,8 +182,54 @@ def is_fzf_tmux_supported():
     except Exception:
         return False
 
+def start_new_session():
+    """Start a new session by picking an agent."""
+    try:
+        # Get list of agents from kiro-cli
+        output = subprocess.check_output(["kiro-cli", "agent", "list"], text=True)
+        agents = []
+        for line in output.split('\n'):
+            line = line.strip()
+            if not line or line.startswith("ID") or "---" in line:
+                continue
+            # Format is typically ID | Name | Description
+            parts = [p.strip() for p in line.split('|')]
+            if parts:
+                agents.append(parts[0])
+
+        if not agents:
+            # Fallback if parsing failed or no agents found
+            print("kiro-cli chat")
+            return
+
+        # Use fzf to pick an agent
+        fzf_cmd = ["fzf", "--header", "Select Agent for New Session", "--reverse", "--height", "40%"]
+        if is_fzf_tmux_supported():
+            fzf_cmd.append("--tmux")
+
+        process = subprocess.Popen(
+            fzf_cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            text=True
+        )
+        stdout, _ = process.communicate(input="\n".join(agents))
+
+        if process.returncode == 0 and stdout:
+            agent = stdout.strip()
+            print(f"kiro-cli chat --agent {agent}")
+        else:
+            # Cancelled or no agent selected, just start default
+            print("kiro-cli chat")
+
+    except Exception:
+        # If kiro-cli agent list fails, just start a default session
+        print("kiro-cli chat")
+
 def select_session(sessions):
-    fzf_input = "\n".join([s["display"] for s in sessions])
+    # Add a special entry for creating a new session
+    new_session_display = f" {GREEN}✚{RESET}\t{BOLD}{GREEN}NEW SESSION{RESET}\t\t\t\t\t\t\t"
+    fzf_input = new_session_display + "\n" + "\n".join([s["display"] for s in sessions])
     
     fzf_cmd = ["fzf"]
     if is_fzf_tmux_supported():
@@ -221,6 +274,9 @@ def select_session(sessions):
         selected_display = selected_lines[0]
         stripped_selected = strip_ansi(selected_display)
         
+        if "NEW SESSION" in stripped_selected:
+            return "NEW"
+
         for s in sessions:
             if strip_ansi(s["display"]) == stripped_selected:
                 return s
@@ -470,31 +526,14 @@ def show_stats():
     projects = {}
     total_msgs = 0
 
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-
-    query = "SELECT value FROM conversations_v2 UNION ALL SELECT value FROM conversations"
-    cursor.execute(query)
-    for row in cursor.fetchall():
-        try:
-            data = json.loads(row[0])
-            model = data.get("model_info", {}).get("model_id", "unknown")
-            models[model] = models.get(model, 0) + 1
-
-            key = "unknown"
-            # We don't have the key directly here easily without more complex query but we can infer from sessions
-        except: continue
-    conn.close()
-
     for s in sessions:
-        project = os.path.basename(s["key"])
+        project = s["project"]
         projects[project] = projects.get(project, 0) + 1
 
-        # Extract message count from display (it's the 5th tab-separated field)
-        try:
-            parts = strip_ansi(s["display"]).split('\t')
-            total_msgs += int(parts[4])
-        except: pass
+        model = s["model"]
+        models[model] = models.get(model, 0) + 1
+
+        total_msgs += s["msg_count"]
 
     print(f"{BOLD}{BLUE}--- Kiro Sessionizer Statistics ---{RESET}")
     print(f"{BOLD}Total Sessions:{RESET}  {total}")
@@ -510,37 +549,12 @@ def show_stats():
 def search_sessions(query):
     all_sessions = get_sessions()
     results = []
-
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-
     query_lower = query.lower()
 
-    # Pre-filter using SQL LIKE for efficiency
-    sql_query = """
-    SELECT key, conversation_id FROM conversations_v2 WHERE value LIKE ?
-    UNION ALL
-    SELECT key, 'legacy' FROM conversations WHERE value LIKE ?
-    """
-    cursor.execute(sql_query, (f"%{query}%", f"%{query}%"))
-    matches = set(cursor.fetchall())
-
     for s in all_sessions:
-        if (s["key"], s["id"]) not in matches:
-            continue
-
-        # Get full data to extract snippet
-        if s["id"] == "legacy":
-            cursor.execute("SELECT value FROM conversations WHERE key = ?", (s["key"],))
-        else:
-            cursor.execute("SELECT value FROM conversations_v2 WHERE conversation_id = ? AND key = ?", (s["id"], s["key"]))
-
-        row = cursor.fetchone()
-        if not row: continue
-
-        data = json.loads(row[0])
+        data = s["data"]
         transcript_text = " ".join(data.get("transcript", []))
-        summary_text = data.get("latest_summary", "")
+        summary_text = data.get("latest_summary", "") or ""
         full_text = transcript_text + " " + summary_text
 
         if query_lower in full_text.lower():
@@ -557,8 +571,92 @@ def search_sessions(query):
             s["display"] = "\t".join(parts)
             results.append(s)
 
-    conn.close()
     return results
+
+def show_timeline():
+    sessions = get_sessions()
+    if not sessions:
+        print("No sessions found.")
+        return
+
+    from datetime import date, timedelta
+    today = date.today()
+    yesterday = today - timedelta(days=1)
+
+    groups = {
+        "TODAY": [],
+        "YESTERDAY": [],
+        "OLDER": {}, # date_str -> list
+        "LEGACY / UNKNOWN": []
+    }
+
+    for s in sessions:
+        if s["updated_at"] == 0:
+            groups["LEGACY / UNKNOWN"].append(s)
+            continue
+
+        dt = datetime.fromtimestamp(s["updated_at"] / 1000).date()
+        if dt == today:
+            groups["TODAY"].append(s)
+        elif dt == yesterday:
+            groups["YESTERDAY"].append(s)
+        else:
+            date_str = dt.strftime("%Y-%m-%d")
+            if date_str not in groups["OLDER"]:
+                groups["OLDER"][date_str] = []
+            groups["OLDER"][date_str].append(s)
+
+    def print_group(name, group_sessions):
+        if not group_sessions: return
+        print(f"\n{BOLD}{YELLOW}=== {name} ==={RESET}")
+        for s in group_sessions:
+            # Reformat display for timeline: remove the date column since it's in the header
+            parts = s["display"].split('\t')
+            # 1:icon, 2:proj, 3:date, 4:model, 5:msgs, 6:preview
+            line = f"{parts[0]} {parts[1]} {parts[3]} {parts[4]} msgs | {parts[5]}"
+            print(line)
+
+    print_group("TODAY", groups["TODAY"])
+    print_group("YESTERDAY", groups["YESTERDAY"])
+    for d in sorted(groups["OLDER"].keys(), reverse=True):
+        print_group(d, groups["OLDER"][d])
+    print_group("LEGACY / UNKNOWN", groups["LEGACY / UNKNOWN"])
+
+def show_report():
+    sessions = get_sessions()
+    if not sessions:
+        print("No sessions found.")
+        return
+
+    from datetime import date
+    today = date.today()
+
+    today_sessions = [s for s in sessions if datetime.fromtimestamp(s["updated_at"] / 1000).date() == today]
+
+    if not today_sessions:
+        print(f"{YELLOW}No activity recorded for today.{RESET}")
+        return
+
+    print(f"{BOLD}{BLUE}--- Daily Activity Report ({today.strftime('%Y-%m-%d')}) ---{RESET}\n")
+
+    by_project = {}
+    for s in today_sessions:
+        proj = s["project"]
+        if proj not in by_project:
+            by_project[proj] = []
+        by_project[proj].append(s)
+
+    for proj, projsessions in by_project.items():
+        print(f"{BOLD}Project: {proj}{RESET}")
+        for s in projsessions:
+            summary = s["data"].get("latest_summary")
+            content = summary if summary else s["last_user_msg"]
+            if not content:
+                content = s["preview"]
+
+            time_str = datetime.fromtimestamp(s["updated_at"] / 1000).strftime("%H:%M")
+            print(f"  [{time_str}] {content}")
+        print()
 
 def main():
     parser = argparse.ArgumentParser(description="Global session resume support for kiro-cli")
@@ -584,10 +682,17 @@ def main():
 
     parser_stats = subparsers.add_parser("stats", help="Show session statistics")
 
+    parser_timeline = subparsers.add_parser("timeline", help="Show chronological session history")
+
+    parser_report = subparsers.add_parser("report", help="Generate daily activity report")
+
     parser_continue = subparsers.add_parser("continue", help="Resume the most recent session")
+    parser_continue.add_argument("--project", help="Resume the most recent session for a specific project")
 
     parser_search = subparsers.add_parser("search", help="Search session transcripts")
     parser_search.add_argument("query", help="Search term")
+
+    parser_new = subparsers.add_parser("new", help="Start a new chat session")
 
     args = parser.parse_args()
 
@@ -620,15 +725,36 @@ def main():
         show_stats()
         return
 
+    if args.command == "timeline":
+        show_timeline()
+        return
+
+    if args.command == "report":
+        show_report()
+        return
+
     if args.command == "continue":
         sessions = get_sessions()
-        if sessions:
-            selected = sessions[0] # sessions are sorted by updated_at DESC
-            update_session(selected)
-            safe_key = shlex.quote(selected['key'])
-            print(f"cd {safe_key} && kiro-cli chat --resume")
-        else:
+        if not sessions:
             print("No sessions found.", file=sys.stderr)
+            return
+
+        selected = None
+        if args.project:
+            proj_query = args.project.lower()
+            for s in sessions:
+                if proj_query in s["project"].lower():
+                    selected = s
+                    break
+            if not selected:
+                print(f"No sessions found for project matching '{args.project}'", file=sys.stderr)
+                return
+        else:
+            selected = sessions[0] # sessions are sorted by updated_at DESC
+
+        update_session(selected)
+        safe_key = shlex.quote(selected['key'])
+        print(f"cd {safe_key} && kiro-cli chat --resume")
         return
 
     if args.command == "search":
@@ -638,10 +764,16 @@ def main():
             return
 
         selected = select_session(results)
-        if selected:
+        if selected == "NEW":
+            start_new_session()
+        elif selected:
             update_session(selected)
             safe_key = shlex.quote(selected['key'])
             print(f"cd {safe_key} && kiro-cli chat --resume")
+        return
+
+    if args.command == "new":
+        start_new_session()
         return
 
     # Interactive picker mode
@@ -651,7 +783,9 @@ def main():
         return
 
     selected = select_session(sessions)
-    if selected:
+    if selected == "NEW":
+        start_new_session()
+    elif selected:
         if selected["pid"]:
             print(f"\n{BOLD}{YELLOW}Notice: Session is active (PID {selected['pid']}).{RESET}", file=sys.stderr)
             print(f"{DIM}Attempting to resume...{RESET}\n", file=sys.stderr)
