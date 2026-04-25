@@ -7,9 +7,16 @@ import subprocess
 from datetime import datetime
 import re
 import glob
+import signal
 
-DB_PATH = os.environ.get("KIRO_DB_PATH") or os.path.expanduser("~/Library/Application Support/kiro-cli/data.sqlite3")
-SESSIONS_DIR = os.environ.get("KIRO_SESSIONS_DIR") or os.path.expanduser("~/.kiro/sessions/cli")
+def get_db_path():
+    return os.environ.get("KIRO_DB_PATH") or os.path.expanduser("~/Library/Application Support/kiro-cli/data.sqlite3")
+
+def get_sessions_dir():
+    return os.environ.get("KIRO_SESSIONS_DIR") or os.path.expanduser("~/.kiro/sessions/cli")
+
+DB_PATH = get_db_path()
+SESSIONS_DIR = get_sessions_dir()
 
 # ANSI Color Codes
 BLUE = "\033[34m"
@@ -23,8 +30,10 @@ DIM = "\033[2m"
 ITALIC = "\033[3m"
 RESET = "\033[0m"
 
+ANSI_ESCAPE = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
+
 def strip_ansi(text):
-    return re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])').sub('', text)
+    return ANSI_ESCAPE.sub('', text)
 
 def is_process_running(pid):
     """Check if a process with the given PID is running and is a kiro-cli process."""
@@ -120,18 +129,20 @@ def get_sessions():
             
             # Extract first user message for better differentiation
             preview = ""
-            first_user_msg = ""
+            last_user_msg = ""
             for line in reversed(transcript):
                 if line.strip():
                     stripped = line.strip()
                     if stripped.startswith("> "):
-                        first_user_msg = stripped[2:].strip().replace("\n", " ")[:120]
+                        if not last_user_msg:
+                            last_user_msg = stripped[2:].strip().replace("\n", " ")[:120]
                     else:
-                        preview = stripped.replace("\n", " ")[:100]
-                    break
+                        if not preview:
+                            preview = stripped.replace("\n", " ")[:100]
+                    if last_user_msg and preview:
+                        break
             
             dt = datetime.fromtimestamp(updated_at / 1000) if updated_at > 0 else datetime.now()
-            date_str = dt.strftime("%Y-%m-%d %H:%M")
             
             project = os.path.basename(key)[:20]
             model_short = model.split(".")[-1][:16] if "." in model else model[:16]
@@ -148,7 +159,7 @@ def get_sessions():
                 f"{YELLOW}{date_str}{RESET}\t"
                 f"{CYAN}{model_short}{RESET}\t"
                 f"{MAGENTA}{msg_count}{RESET}\t"
-                f"{first_user_msg if first_user_msg else preview}\t"
+                f"{last_user_msg if last_user_msg else preview}\t"
                 f"{GREEN}{key}{RESET}\t"
                 f"{pid if pid else ''}\t"
                 f"{conv_id}"
@@ -159,7 +170,10 @@ def get_sessions():
                 "id": conv_id,
                 "display": display,
                 "source": source,
-                "pid": pid
+                "pid": pid,
+                "data": data,
+                "updated_at": updated_at,
+                "last_user_msg": last_user_msg
             })
         except Exception:
             continue
@@ -236,23 +250,26 @@ def delete_sessions(pairs):
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
 
+    v1_deletes = []
+    v2_deletes = []
+
     for conv_id, key in pairs:
+        # Sanitize
+        conv_id = os.path.basename(conv_id)
+
         # Kill active process if any
         pid = active_map.get(key)
         if pid:
             try:
-                os.kill(pid, 15)  # SIGTERM
+                os.kill(pid, signal.SIGTERM)
             except OSError:
                 pass
 
-        # Delete from DB
+        # Queue DB deletes
         if conv_id == "legacy":
-            cursor.execute("DELETE FROM conversations WHERE key = ?", (key,))
+            v1_deletes.append((key,))
         else:
-            cursor.execute(
-                "DELETE FROM conversations_v2 WHERE conversation_id = ? AND key = ?",
-                (conv_id, key)
-            )
+            v2_deletes.append((conv_id, key))
 
         # Remove session files
         if conv_id != "legacy":
@@ -262,6 +279,11 @@ def delete_sessions(pairs):
                     os.remove(path)
                 except OSError:
                     pass
+
+    if v1_deletes:
+        cursor.executemany("DELETE FROM conversations WHERE key = ?", v1_deletes)
+    if v2_deletes:
+        cursor.executemany("DELETE FROM conversations_v2 WHERE conversation_id = ? AND key = ?", v2_deletes)
 
     conn.commit()
     conn.close()
@@ -401,6 +423,9 @@ def dump_sessions(dest_dir, specific_session_id=None):
     for row in rows:
         key, conv_id, value, updated_at, source = row
 
+        # Sanitize
+        conv_id = os.path.basename(conv_id)
+
         if specific_session_id and specific_session_id != conv_id:
             continue
 
@@ -507,6 +532,111 @@ def show_stats():
     for m, count in sorted(models.items(), key=lambda x: x[1], reverse=True):
         print(f"  {m:20} {count} sessions")
 
+def show_report():
+    sessions = get_sessions()
+    if not sessions:
+        print("No sessions found.")
+        return
+
+    today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+    today_ms = int(today.timestamp() * 1000)
+
+    report_items = {} # Grouped by project
+
+    for s in sessions:
+        if s.get("updated_at", 0) < today_ms:
+            continue
+
+        project = os.path.basename(s["key"])
+        data = s.get("data", {})
+        summary = data.get("latest_summary")
+        last_msg = s.get("last_user_msg", "")
+
+        accomplishment = summary if summary else (last_msg if last_msg else None)
+        if accomplishment:
+            if project not in report_items:
+                report_items[project] = []
+            report_items[project].append(accomplishment)
+
+    print(f"{BOLD}{GREEN}=== DAILY ACCOMPLISHMENTS REPORT ({today.strftime('%Y-%m-%d')}) ==={RESET}\n")
+
+    if not report_items:
+        print("No activity recorded today.")
+        return
+
+    for project, items in report_items.items():
+        print(f"{BOLD}{BLUE}[{project}]{RESET}")
+        # Use a set to avoid near-duplicate summaries if multiple sessions in same project
+        seen = set()
+        for item in items:
+            cleaned = item.strip().replace("\n", " ")
+            if cleaned not in seen:
+                print(f"  • {cleaned}")
+                seen.add(cleaned)
+        print()
+
+def show_timeline():
+    from datetime import timedelta
+    sessions = get_sessions()
+    if not sessions:
+        print("No sessions found.")
+        return
+
+    now = datetime.now()
+    today = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    yesterday = today - timedelta(days=1)
+
+    groups = {
+        "TODAY": [],
+        "YESTERDAY": [],
+        "OLDER": {}, # Keyed by date string
+        "LEGACY / UNKNOWN": []
+    }
+
+    for s in sessions:
+        updated_at = s.get("updated_at", 0)
+        if updated_at == 0:
+            groups["LEGACY / UNKNOWN"].append(s)
+            continue
+
+        dt = datetime.fromtimestamp(updated_at / 1000)
+        dt_day = dt.replace(hour=0, minute=0, second=0, microsecond=0)
+
+        data = s.get("data", {})
+        summary = data.get("latest_summary")
+        last_msg = s.get("last_user_msg", "")
+        content = summary if summary else (last_msg if last_msg else "No content")
+        content = content.replace("\n", " ")[:80]
+
+        project = os.path.basename(s["key"])
+        time_str = dt.strftime("%H:%M")
+
+        display = f"  {BOLD}{CYAN}{time_str}{RESET}  {BOLD}{BLUE}{project:15}{RESET}  {content}"
+
+        if dt_day == today:
+            groups["TODAY"].append(display)
+        elif dt_day == yesterday:
+            groups["YESTERDAY"].append(display)
+        else:
+            date_key = dt_day.strftime("%Y-%m-%d")
+            if date_key not in groups["OLDER"]:
+                groups["OLDER"][date_key] = []
+            groups["OLDER"][date_key].append(display)
+
+    # Print Timeline
+    print(f"{BOLD}{MAGENTA}=== SESSION TIMELINE ==={RESET}\n")
+
+    order = ["TODAY", "YESTERDAY"] + sorted(groups["OLDER"].keys(), reverse=True) + ["LEGACY / UNKNOWN"]
+
+    for section in order:
+        items = groups[section] if section in ["TODAY", "YESTERDAY", "LEGACY / UNKNOWN"] else groups["OLDER"].get(section, [])
+        if not items: continue
+
+        print(f"{BOLD}{YELLOW}{section}{RESET}")
+        for item in items:
+            print(item)
+        print()
+
 def search_sessions(query):
     all_sessions = get_sessions()
     results = []
@@ -585,9 +715,16 @@ def main():
     parser_stats = subparsers.add_parser("stats", help="Show session statistics")
 
     parser_continue = subparsers.add_parser("continue", help="Resume the most recent session")
+    parser_continue.add_argument("--project", help="Resume latest session for specific project")
 
     parser_search = subparsers.add_parser("search", help="Search session transcripts")
     parser_search.add_argument("query", help="Search term")
+
+    parser_timeline = subparsers.add_parser("timeline", help="Show chronological session history")
+
+    parser_report = subparsers.add_parser("report", help="Generate a daily activity report")
+
+    parser_new = subparsers.add_parser("new", help="Start a new agent session")
 
     args = parser.parse_args()
 
@@ -622,13 +759,72 @@ def main():
 
     if args.command == "continue":
         sessions = get_sessions()
-        if sessions:
-            selected = sessions[0] # sessions are sorted by updated_at DESC
-            update_session(selected)
-            safe_key = shlex.quote(selected['key'])
-            print(f"cd {safe_key} && kiro-cli chat --resume")
-        else:
+        if not sessions:
             print("No sessions found.", file=sys.stderr)
+            return
+
+        selected = None
+        if args.project:
+            for s in sessions:
+                project = os.path.basename(s["key"])
+                if args.project.lower() in project.lower():
+                    selected = s
+                    break
+            if not selected:
+                print(f"No sessions found for project '{args.project}'", file=sys.stderr)
+                return
+        else:
+            selected = sessions[0] # sessions are sorted by updated_at DESC
+
+        update_session(selected)
+        safe_key = shlex.quote(selected['key'])
+        print(f"cd {safe_key} && kiro-cli chat --resume")
+        return
+
+    if args.command == "report":
+        show_report()
+        return
+
+    if args.command == "new":
+        # First, check if kiro-cli is available
+        try:
+            output = subprocess.check_output(["kiro-cli", "agent", "list"], text=True)
+            agents = []
+            for line in output.strip().split('\n'):
+                if line.strip() and not line.startswith('-'):
+                    agents.append(line.strip())
+
+            if not agents:
+                print("kiro-cli chat", file=sys.stderr)
+                return
+
+            fzf_input = "\n".join(agents)
+            fzf_cmd = ["fzf", "--header", "Select an Agent for New Session", "--reverse", "--height", "40%"]
+            if is_fzf_tmux_supported():
+                fzf_cmd.append("--tmux")
+
+            process = subprocess.Popen(
+                fzf_cmd,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=sys.stderr,
+                text=True
+            )
+            stdout, _ = process.communicate(input=fzf_input)
+
+            if process.returncode == 0 and stdout:
+                agent = stdout.strip()
+                print(f"kiro-cli chat --agent {shlex.quote(agent)}")
+            else:
+                # Cancelled or error, don't do anything
+                pass
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            # Fallback if kiro-cli isn't in PATH or agent list fails
+            print("kiro-cli chat")
+        return
+
+    if args.command == "timeline":
+        show_timeline()
         return
 
     if args.command == "search":
