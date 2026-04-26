@@ -4,7 +4,7 @@ import json
 import os
 import sys
 import subprocess
-from datetime import datetime
+from datetime import datetime, timedelta
 import re
 import glob
 
@@ -121,14 +121,23 @@ def get_sessions():
             # Extract first user message for better differentiation
             preview = ""
             first_user_msg = ""
+            last_user_msg = ""
             for line in reversed(transcript):
-                if line.strip():
-                    stripped = line.strip()
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                if not preview:
                     if stripped.startswith("> "):
                         first_user_msg = stripped[2:].strip().replace("\n", " ")[:120]
                     else:
                         preview = stripped.replace("\n", " ")[:100]
-                    break
+
+                if not last_user_msg and stripped.startswith("> "):
+                    last_user_msg = stripped[2:].strip()
+
+            # If we found no preview from non-user messages, use the last user message
+            if not preview and last_user_msg:
+                preview = last_user_msg[:100]
             
             dt = datetime.fromtimestamp(updated_at / 1000) if updated_at > 0 else datetime.now()
             date_str = dt.strftime("%Y-%m-%d %H:%M")
@@ -159,7 +168,10 @@ def get_sessions():
                 "id": conv_id,
                 "display": display,
                 "source": source,
-                "pid": pid
+                "pid": pid,
+                "updated_at": updated_at,
+                "data": data,
+                "last_user_msg": last_user_msg
             })
         except Exception:
             continue
@@ -507,6 +519,128 @@ def show_stats():
     for m, count in sorted(models.items(), key=lambda x: x[1], reverse=True):
         print(f"  {m:20} {count} sessions")
 
+def show_timeline():
+    sessions = get_sessions()
+    if not sessions:
+        print("No sessions found.")
+        return
+
+    now = datetime.now()
+    today = now.date()
+    yesterday = today - timedelta(days=1)
+
+    current_group = None
+
+    for s in sessions:
+        if s["updated_at"] == 0:
+            group = "LEGACY / UNKNOWN"
+        else:
+            dt = datetime.fromtimestamp(s["updated_at"] / 1000)
+            d = dt.date()
+            if d == today:
+                group = "TODAY"
+            elif d == yesterday:
+                group = "YESTERDAY"
+            else:
+                group = d.strftime("%Y-%m-%d")
+
+        if group != current_group:
+            print(f"\n{BOLD}{YELLOW}--- {group} ---{RESET}")
+            current_group = group
+
+        print(s["display"])
+
+def generate_report():
+    sessions = get_sessions()
+    if not sessions:
+        print("No sessions found.")
+        return
+
+    today = datetime.now().date()
+    today_sessions = [s for s in sessions if s["updated_at"] > 0 and datetime.fromtimestamp(s["updated_at"] / 1000).date() == today]
+
+    if not today_sessions:
+        print("No activity recorded for today.")
+        return
+
+    print(f"{BOLD}{BLUE}--- Daily Activity Report ({today.strftime('%Y-%m-%d')}) ---{RESET}")
+
+    # Group by project
+    projects = {}
+    for s in today_sessions:
+        project = os.path.basename(s["key"])
+        if project not in projects:
+            projects[project] = []
+        projects[project].append(s)
+
+    for project, items in projects.items():
+        print(f"\n{BOLD}{CYAN}Project: {project}{RESET}")
+        for s in items:
+            summary = s["data"].get("latest_summary")
+            last_msg = s["last_user_msg"]
+
+            content = summary if summary else (last_msg if last_msg else "No summary available")
+            # Wrap content slightly
+            content = content.replace("\n", " ")
+            if len(content) > 150:
+                content = content[:147] + "..."
+
+            print(f"  {GREEN}●{RESET} {content}")
+
+def new_session():
+    try:
+        # Try to list agents
+        result = subprocess.run(["kiro-cli", "agent", "list"], capture_output=True, text=True)
+        if result.returncode != 0:
+            # Fallback to standard chat if agent list fails
+            print("kiro-cli chat")
+            return
+
+        agents_output = result.stdout.strip()
+        if not agents_output:
+            print("kiro-cli chat")
+            return
+
+        # Filter out headers and empty lines
+        agents = []
+        for line in agents_output.split('\n'):
+            line = line.strip()
+            if not line or "AGENT" in line.upper() or "---" in line:
+                continue
+            # Assume first column is the agent ID
+            agents.append(line.split()[0])
+
+        if not agents:
+            print("kiro-cli chat")
+            return
+
+        # Add '+ NEW SESSION' option for consistency (though here we already know we want a new one)
+        # Just use fzf to select an agent
+        fzf_cmd = ["fzf", "--header", "Select an AI Agent", "--height", "40%", "--reverse"]
+        if is_fzf_tmux_supported():
+            fzf_cmd.append("--tmux")
+
+        process = subprocess.Popen(
+            fzf_cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=sys.stderr,
+            text=True
+        )
+        stdout, _ = process.communicate(input="\n".join(agents))
+
+        if process.returncode != 0 or not stdout:
+            return
+
+        selected_agent = stdout.strip()
+        safe_agent = shlex.quote(selected_agent)
+        print(f"kiro-cli chat --agent {safe_agent}")
+
+    except FileNotFoundError:
+        # kiro-cli not in PATH, but we want to return the command anyway for the wrapper to handle
+        # or maybe the user just wants standard chat
+        print("kiro-cli chat")
+
 def search_sessions(query):
     all_sessions = get_sessions()
     results = []
@@ -585,9 +719,16 @@ def main():
     parser_stats = subparsers.add_parser("stats", help="Show session statistics")
 
     parser_continue = subparsers.add_parser("continue", help="Resume the most recent session")
+    parser_continue.add_argument("--project", help="Filter by project name")
 
     parser_search = subparsers.add_parser("search", help="Search session transcripts")
     parser_search.add_argument("query", help="Search term")
+
+    parser_timeline = subparsers.add_parser("timeline", help="Show a chronological timeline of sessions")
+
+    parser_report = subparsers.add_parser("report", help="Generate a daily activity report")
+
+    parser_new = subparsers.add_parser("new", help="Start a new session with an agent")
 
     args = parser.parse_args()
 
@@ -622,13 +763,31 @@ def main():
 
     if args.command == "continue":
         sessions = get_sessions()
+        if args.project:
+            sessions = [s for s in sessions if args.project.lower() in os.path.basename(s["key"]).lower()]
+
         if sessions:
             selected = sessions[0] # sessions are sorted by updated_at DESC
             update_session(selected)
             safe_key = shlex.quote(selected['key'])
             print(f"cd {safe_key} && kiro-cli chat --resume")
         else:
-            print("No sessions found.", file=sys.stderr)
+            if args.project:
+                print(f"No sessions found for project '{args.project}'.", file=sys.stderr)
+            else:
+                print("No sessions found.", file=sys.stderr)
+        return
+
+    if args.command == "new":
+        new_session()
+        return
+
+    if args.command == "report":
+        generate_report()
+        return
+
+    if args.command == "timeline":
+        show_timeline()
         return
 
     if args.command == "search":
