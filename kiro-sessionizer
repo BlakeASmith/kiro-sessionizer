@@ -20,6 +20,14 @@ else
                 echo "$COMMAND"
             fi
             ;;
+        new)
+            COMMAND=$(kiro_sessionizer "$@")
+            if [[ "$COMMAND" == kiro-cli\ * ]]; then
+                eval "$COMMAND"
+            else
+                echo "$COMMAND"
+            fi
+            ;;
         *)
             kiro_sessionizer "$@"
             ;;
