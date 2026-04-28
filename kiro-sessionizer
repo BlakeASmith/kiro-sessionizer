@@ -6,21 +6,24 @@
 
 if [ $# -eq 0 ]; then
     COMMAND=$(kiro_sessionizer)
-    if [ -n "$COMMAND" ]; then
+    if [[ "$COMMAND" == cd\ * ]] || [[ "$COMMAND" == kiro-cli\ * ]]; then
         eval "$COMMAND"
+    elif [ -n "$COMMAND" ]; then
+        echo "$COMMAND"
     fi
 else
-    # Check if the subcommand might return a resume command (search or continue)
+    # Check if the subcommand might return a shell command (search, continue, or new)
     case "$1" in
-        search|continue)
+        search|continue|new)
             COMMAND=$(kiro_sessionizer "$@")
-            if [[ "$COMMAND" == cd\ * ]]; then
+            if [[ "$COMMAND" == cd\ * ]] || [[ "$COMMAND" == kiro-cli\ * ]]; then
                 eval "$COMMAND"
             else
                 echo "$COMMAND"
             fi
             ;;
         *)
+            # For interactive picker (no args), it might return a cd or kiro-cli command
             kiro_sessionizer "$@"
             ;;
     esac
