@@ -7,14 +7,30 @@
 if [ $# -eq 0 ]; then
     COMMAND=$(kiro_sessionizer)
     if [ -n "$COMMAND" ]; then
-        eval "$COMMAND"
+        if [[ "$COMMAND" == cd\ * ]]; then
+            eval "$COMMAND"
+        elif [[ "$COMMAND" == kiro-cli\ * ]]; then
+            eval "$COMMAND"
+        else
+            echo "$COMMAND"
+        fi
     fi
 else
     # Check if the subcommand might return a resume command (search or continue)
     case "$1" in
-        search|continue)
+        search|continue|timeline)
             COMMAND=$(kiro_sessionizer "$@")
             if [[ "$COMMAND" == cd\ * ]]; then
+                eval "$COMMAND"
+            elif [[ "$COMMAND" == kiro-cli\ * ]]; then
+                eval "$COMMAND"
+            else
+                echo "$COMMAND"
+            fi
+            ;;
+        new)
+            COMMAND=$(kiro_sessionizer "$@")
+            if [[ "$COMMAND" == kiro-cli\ * ]]; then
                 eval "$COMMAND"
             else
                 echo "$COMMAND"
