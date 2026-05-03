@@ -12,9 +12,9 @@ if [ $# -eq 0 ]; then
 else
     # Check if the subcommand might return a resume command (search or continue)
     case "$1" in
-        search|continue)
+        search|continue|timeline|new)
             COMMAND=$(kiro_sessionizer "$@")
-            if [[ "$COMMAND" == cd\ * ]]; then
+            if [[ "$COMMAND" == cd\ * ]] || [[ "$COMMAND" == kiro-cli\ * ]]; then
                 eval "$COMMAND"
             else
                 echo "$COMMAND"
