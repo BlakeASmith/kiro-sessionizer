@@ -4,7 +4,7 @@ import json
 import os
 import sys
 import subprocess
-from datetime import datetime
+from datetime import datetime, timedelta
 import re
 import glob
 
@@ -159,7 +159,9 @@ def get_sessions():
                 "id": conv_id,
                 "display": display,
                 "source": source,
-                "pid": pid
+                "pid": pid,
+                "updated_at": updated_at,
+                "data": data
             })
         except Exception:
             continue
@@ -178,6 +180,12 @@ def is_fzf_tmux_supported():
 def select_session(sessions):
     fzf_input = "\n".join([s["display"] for s in sessions])
     
+    # Calculate indices of headers to make them non-selectable
+    header_lines = []
+    for i, s in enumerate(sessions):
+        if s.get("is_header"):
+            header_lines.append(str(i + 1)) # fzf uses 1-based indexing
+
     fzf_cmd = ["fzf"]
     if is_fzf_tmux_supported():
         fzf_cmd.append("--tmux")
@@ -196,6 +204,14 @@ def select_session(sessions):
         "--color", "header:italic:underline,pointer:bold:blue,marker:bold:green",
         "--preview", f"python3 {__file__} preview {{7}} {{9}} {{8}} {{2}}",
         "--bind", f"ctrl-x:execute(python3 {__file__} delete-multi {{+9}} --keys {{+7}})+reload(python3 {__file__} list)",
+    ])
+
+    if header_lines:
+        # We use a trick to make these lines unselectable if fzf version supports it,
+        # but the safest is to handle it on the return side which we already do.
+        pass
+
+    fzf_cmd.extend([
         "--info", "inline",
         "--footer", f"{DIM}ctrl-x: delete  tab: select multi{RESET}",
     ])
@@ -222,6 +238,8 @@ def select_session(sessions):
         stripped_selected = strip_ansi(selected_display)
         
         for s in sessions:
+            if s.get("is_header"):
+                continue
             if strip_ansi(s["display"]) == stripped_selected:
                 return s
     except FileNotFoundError:
@@ -266,6 +284,170 @@ def delete_sessions(pairs):
     conn.commit()
     conn.close()
 
+
+def get_timeline_sessions():
+    sessions = get_sessions()
+    if not sessions:
+        print("No sessions found.", file=sys.stderr)
+        return
+
+    now = datetime.now()
+    today = now.date()
+    yesterday = today - timedelta(days=1)
+
+    groups = {
+        "TODAY": [],
+        "YESTERDAY": [],
+        "YYYY-MM-DD": {}, # Sub-grouped by date string
+        "LEGACY / UNKNOWN": []
+    }
+
+    for s in sessions:
+        updated_at = s.get("updated_at", 0)
+        if updated_at == 0:
+            groups["LEGACY / UNKNOWN"].append(s)
+            continue
+
+        dt = datetime.fromtimestamp(updated_at / 1000)
+        d = dt.date()
+
+        if d == today:
+            groups["TODAY"].append(s)
+        elif d == yesterday:
+            groups["YESTERDAY"].append(s)
+        else:
+            date_str = d.strftime("%Y-%m-%d")
+            if date_str not in groups["YYYY-MM-DD"]:
+                groups["YYYY-MM-DD"][date_str] = []
+            groups["YYYY-MM-DD"][date_str].append(s)
+
+    # Sort YYYY-MM-DD groups descending
+    sorted_dates = sorted(groups["YYYY-MM-DD"].keys(), reverse=True)
+
+    def print_group(name, items):
+        if not items: return
+        header_display = f"\t{BOLD}{WHITE_ON_GREY} {name} {RESET}\t\t\t\t\t"
+        # We use a special marker in the session object to identify headers
+        print(header_display)
+        for item in items:
+            print(item["display"])
+
+    # Define color for headers if not already defined
+    # Using existing ones or adding new
+    WHITE_ON_GREY = "\033[37;48;5;238m"
+
+    output = []
+
+    def add_group(name, items):
+        if not items: return
+        # Header entry
+        header_display = f" \t{BOLD}{WHITE_ON_GREY}  {name}  {RESET}\t\t\t\t\t\t\t"
+        output.append({"display": header_display, "is_header": True})
+        for item in items:
+            output.append(item)
+
+    # Add "+ NEW SESSION" entry at the very top
+    new_entry = {
+        "display": f"{GREEN}+ NEW SESSION{RESET}\t\t\t\t\t\t\t",
+        "is_new": True
+    }
+    output.append(new_entry)
+
+    add_group("TODAY", groups["TODAY"])
+    add_group("YESTERDAY", groups["YESTERDAY"])
+    for d_str in sorted_dates:
+        add_group(d_str, groups["YYYY-MM-DD"][d_str])
+    add_group("LEGACY / UNKNOWN", groups["LEGACY / UNKNOWN"])
+
+    return output
+
+def show_timeline():
+    sessions = get_timeline_sessions()
+    if sessions:
+        for s in sessions:
+            print(s["display"])
+
+def generate_report():
+    sessions = get_sessions()
+    if not sessions:
+        print("No sessions found.", file=sys.stderr)
+        return
+
+    today = datetime.now().date()
+    today_sessions = []
+    for s in sessions:
+        updated_at = s.get("updated_at", 0)
+        if updated_at > 0:
+            dt = datetime.fromtimestamp(updated_at / 1000)
+            if dt.date() == today:
+                today_sessions.append(s)
+
+    if not today_sessions:
+        print(f"No activity found for today ({today}).", file=sys.stderr)
+        return
+
+    # Group by project
+    project_work = {}
+    for s in today_sessions:
+        project = os.path.basename(s["key"])
+        if project not in project_work:
+            project_work[project] = []
+
+        data = s.get("data", {})
+        summary = data.get("latest_summary")
+        if not summary:
+            # Fallback to last user message or last transcript entry
+            transcript = data.get("transcript", [])
+            for line in reversed(transcript):
+                if line.strip():
+                    summary = line.strip()
+                    if summary.startswith("> "):
+                        summary = summary[2:].strip()
+                    break
+
+        if summary:
+            project_work[project].append(summary)
+
+    print(f"{BOLD}{BLUE}--- Daily Activity Report: {today} ---{RESET}")
+    for project, summaries in project_work.items():
+        print(f"\n{BOLD}{CYAN}Project: {project}{RESET}")
+        # De-duplicate similar summaries if any
+        seen = set()
+        for summary in reversed(summaries): # Show oldest to newest
+            if summary not in seen:
+                print(f"  - {summary}")
+                seen.add(summary)
+
+def new_session():
+    sessions = get_sessions()
+    unique_projects = {}
+    for s in sessions:
+        project = os.path.basename(s["key"])
+        if project not in unique_projects:
+            unique_projects[project] = s["key"]
+
+    if not unique_projects:
+        print("No existing projects found to start a new session in.", file=sys.stderr)
+        # Fallback: just run kiro-cli chat in current dir
+        print("kiro-cli chat")
+        return
+
+    # Use fzf to select a project
+    project_list = "\n".join([f"{p}\t{path}" for p, path in unique_projects.items()])
+
+    fzf_cmd = ["fzf", "--ansi", "--header", f"{BOLD}{BLUE}Select Project for New Session{RESET}", "--delimiter", "\t", "--with-nth", "1"]
+    if is_fzf_tmux_supported():
+        fzf_cmd.append("--tmux")
+
+    try:
+        process = subprocess.Popen(fzf_cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+        stdout, _ = process.communicate(input=project_list)
+        if process.returncode == 0 and stdout:
+            selected_project = stdout.strip().split("\t")[0]
+            path = unique_projects[selected_project]
+            print(f"cd {shlex.quote(path)} && kiro-cli chat")
+    except Exception as e:
+        print(f"Error selecting project: {e}", file=sys.stderr)
 
 def update_session(session):
     if session["source"] == "v1":
@@ -584,10 +766,17 @@ def main():
 
     parser_stats = subparsers.add_parser("stats", help="Show session statistics")
 
+    parser_report = subparsers.add_parser("report", help="Generate daily activity report")
+
     parser_continue = subparsers.add_parser("continue", help="Resume the most recent session")
+    parser_continue.add_argument("--project", help="Resume recent session for a specific project")
 
     parser_search = subparsers.add_parser("search", help="Search session transcripts")
     parser_search.add_argument("query", help="Search term")
+
+    parser_timeline = subparsers.add_parser("timeline", help="Show sessions grouped by date")
+
+    parser_new = subparsers.add_parser("new", help="Start a new session in an existing project")
 
     args = parser.parse_args()
 
@@ -620,15 +809,33 @@ def main():
         show_stats()
         return
 
+    if args.command == "report":
+        generate_report()
+        return
+
     if args.command == "continue":
         sessions = get_sessions()
-        if sessions:
-            selected = sessions[0] # sessions are sorted by updated_at DESC
-            update_session(selected)
-            safe_key = shlex.quote(selected['key'])
-            print(f"cd {safe_key} && kiro-cli chat --resume")
-        else:
+        if not sessions:
             print("No sessions found.", file=sys.stderr)
+            return
+
+        selected = None
+        if args.project:
+            query = args.project.lower()
+            for s in sessions:
+                project_name = os.path.basename(s["key"]).lower()
+                if query in project_name:
+                    selected = s
+                    break
+            if not selected:
+                print(f"No recent session found for project matching '{args.project}'", file=sys.stderr)
+                return
+        else:
+            selected = sessions[0] # sessions are sorted by updated_at DESC
+
+        update_session(selected)
+        safe_key = shlex.quote(selected['key'])
+        print(f"cd {safe_key} && kiro-cli chat --resume")
         return
 
     if args.command == "search":
@@ -644,14 +851,25 @@ def main():
             print(f"cd {safe_key} && kiro-cli chat --resume")
         return
 
+    if args.command == "timeline":
+        show_timeline()
+        return
+
+    if args.command == "new":
+        new_session()
+        return
+
     # Interactive picker mode
-    sessions = get_sessions()
+    sessions = get_timeline_sessions()
     if not sessions:
-        print("No sessions found.", file=sys.stderr)
         return
 
     selected = select_session(sessions)
     if selected:
+        if selected.get("is_new"):
+            new_session()
+            return
+
         if selected["pid"]:
             print(f"\n{BOLD}{YELLOW}Notice: Session is active (PID {selected['pid']}).{RESET}", file=sys.stderr)
             print(f"{DIM}Attempting to resume...{RESET}\n", file=sys.stderr)
