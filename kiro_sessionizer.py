@@ -4,9 +4,11 @@ import json
 import os
 import sys
 import subprocess
-from datetime import datetime
+from datetime import datetime, timedelta
 import re
 import glob
+import uuid
+import shlex
 
 DB_PATH = os.environ.get("KIRO_DB_PATH") or os.path.expanduser("~/Library/Application Support/kiro-cli/data.sqlite3")
 SESSIONS_DIR = os.environ.get("KIRO_SESSIONS_DIR") or os.path.expanduser("~/.kiro/sessions/cli")
@@ -62,22 +64,31 @@ def get_active_sessions():
     # Method 2: Fallback for non-interactive/hidden sessions (ps + lsof)
     try:
         # Get PIDs of all processes whose command line contains 'kiro-cli'
-        ps_cmd = ["pgrep", "-f", "kiro-cli"]
-        pids = subprocess.check_output(ps_cmd, text=True).strip().split('\n')
+        # We also check for 'bun' as kiro-cli might be running via bun
+        ps_cmd = ["pgrep", "-f", "kiro-cli|bun"]
+        pids_out = subprocess.check_output(ps_cmd, text=True).strip()
+        if not pids_out:
+            return active_paths
 
-        for pid_str in pids:
-            if not pid_str: continue
-            pid = int(pid_str)
-            if pid in active_paths.values(): continue # Already found via lock
+        pids = pids_out.split('\n')
+        active_pids = set(active_paths.values())
+        pids_to_check = [p for p in pids if p and int(p) not in active_pids]
 
-            # Use lsof to find the CWD of the process
-            lsof_cmd = ["lsof", "-a", "-p", str(pid), "-d", "cwd", "-Fn"]
-            lsof_out = subprocess.check_output(lsof_cmd, text=True)
-            for line in lsof_out.split('\n'):
-                if line.startswith('n'):
-                    cwd = line[1:].strip()
-                    if cwd and cwd not in active_paths:
-                        active_paths[cwd] = pid
+        if not pids_to_check:
+            return active_paths
+
+        # Use lsof to find the CWD of all processes in one go
+        lsof_cmd = ["lsof", "-a", "-p", ",".join(pids_to_check), "-d", "cwd", "-Fn"]
+        lsof_out = subprocess.check_output(lsof_cmd, text=True)
+
+        current_pid = None
+        for line in lsof_out.split('\n'):
+            if line.startswith('p'):
+                current_pid = int(line[1:])
+            elif line.startswith('n') and current_pid:
+                cwd = line[1:].strip()
+                if cwd and cwd not in active_paths:
+                    active_paths[cwd] = current_pid
     except Exception:
         pass # Fallback failed, ignore
 
@@ -94,14 +105,22 @@ def get_sessions():
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     
-    query = """
-    SELECT key, conversation_id, value, updated_at, 'v2' as source
-    FROM conversations_v2
-    UNION ALL
-    SELECT key, 'legacy' as conversation_id, value, 0 as updated_at, 'v1' as source
-    FROM conversations
-    ORDER BY updated_at DESC;
-    """
+    cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='conversations_v2'")
+    has_v2 = cursor.fetchone() is not None
+    cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='conversations'")
+    has_v1 = cursor.fetchone() is not None
+
+    if not has_v2 and not has_v1:
+        conn.close()
+        return []
+
+    queries = []
+    if has_v2:
+        queries.append("SELECT key, conversation_id, value, updated_at, 'v2' as source FROM conversations_v2")
+    if has_v1:
+        queries.append("SELECT key, 'legacy' as conversation_id, value, 0 as updated_at, 'v1' as source FROM conversations")
+
+    query = " UNION ALL ".join(queries) + " ORDER BY updated_at DESC"
     
     cursor.execute(query)
     rows = cursor.fetchall()
@@ -159,7 +178,9 @@ def get_sessions():
                 "id": conv_id,
                 "display": display,
                 "source": source,
-                "pid": pid
+                "pid": pid,
+                "updated_at": updated_at,
+                "data": data
             })
         except Exception:
             continue
@@ -176,7 +197,24 @@ def is_fzf_tmux_supported():
         return False
 
 def select_session(sessions):
-    fzf_input = "\n".join([s["display"] for s in sessions])
+    # Add "+ NEW SESSION" option
+    new_session_entry = {
+        "key": "NEW",
+        "id": "NEW",
+        "display": f" \t{BOLD}{GREEN}+ NEW SESSION{RESET}\t \t \t \tStart a fresh session in a project directory\t \t \t ",
+        "source": "meta",
+        "pid": None,
+        "is_new": True
+    }
+
+    # We add a header flag to some entries to prevent actions on them
+    header_entry = {
+        "display": f" \t{BOLD}{BLUE}Project{RESET}\t{YELLOW}Date{RESET}\t{CYAN}Model{RESET}\t{MAGENTA}Msgs{RESET}\tPreview / Last Message\t \t \t ",
+        "is_header": True
+    }
+
+    all_entries = [new_session_entry, header_entry] + sessions
+    fzf_input = "\n".join([e["display"] for e in all_entries])
     
     fzf_cmd = ["fzf"]
     if is_fzf_tmux_supported():
@@ -186,7 +224,6 @@ def select_session(sessions):
         "--ansi",
         "--delimiter", "\t",
         "--with-nth", "1,2,3,4,5,6",
-        "--header", f"\t{BOLD}{BLUE}Project{RESET}\t{YELLOW}Date{RESET}\t{CYAN}Model{RESET}\t{MAGENTA}Msgs{RESET}\tLast Message",
         "--reverse",
         "--height", "100%",
         "--preview-window", "bottom:80%:wrap",
@@ -194,10 +231,11 @@ def select_session(sessions):
         "--marker", "✓",
         "--multi",
         "--color", "header:italic:underline,pointer:bold:blue,marker:bold:green",
-        "--preview", f"python3 {__file__} preview {{7}} {{9}} {{8}} {{2}}",
-        "--bind", f"ctrl-x:execute(python3 {__file__} delete-multi {{+9}} --keys {{+7}})+reload(python3 {__file__} list)",
+        "--preview", f"python3 {shlex.quote(__file__)} preview {{7}} {{9}} {{8}} {{2}}",
+        "--bind", f"ctrl-x:execute(python3 {shlex.quote(__file__)} delete-multi {{+9}} --keys {{+7}})+reload(python3 {shlex.quote(__file__)} list)",
+        "--bind", f"ctrl-f:execute(python3 {shlex.quote(__file__)} fork --id {{9}} --key {{7}})+reload(python3 {shlex.quote(__file__)} list)",
         "--info", "inline",
-        "--footer", f"{DIM}ctrl-x: delete  tab: select multi{RESET}",
+        "--footer", f"{DIM}ctrl-x: delete  ctrl-f: fork  tab: multi-select{RESET}",
     ])
 
     try:
@@ -221,9 +259,10 @@ def select_session(sessions):
         selected_display = selected_lines[0]
         stripped_selected = strip_ansi(selected_display)
         
-        for s in sessions:
-            if strip_ansi(s["display"]) == stripped_selected:
-                return s
+        for e in all_entries:
+            if e.get("is_header"): continue
+            if strip_ansi(e["display"]) == stripped_selected:
+                return e
     except FileNotFoundError:
         print("Error: 'fzf' is not installed.", file=sys.stderr)
         sys.exit(1)
@@ -232,6 +271,10 @@ def select_session(sessions):
 
 def delete_sessions(pairs):
     """pairs: list of (conv_id, key) tuples"""
+    # Guard against header selection or empty inputs
+    pairs = [(cid, key) for cid, key in pairs if cid and key and cid.strip() and key.strip() and cid != "NEW" and cid != "id"]
+    if not pairs:
+        return
     active_map = get_active_sessions()
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
@@ -374,7 +417,6 @@ def run_preview(path_ansi, conv_id_ansi, pid_ansi, project_ansi):
         print(f"Error parsing preview: {e}")
 
 import argparse
-import shlex
 
 def dump_sessions(dest_dir, specific_session_id=None):
     if not os.path.exists(DB_PATH):
@@ -458,6 +500,183 @@ def dump_sessions(dest_dir, specific_session_id=None):
             continue
 
     print(f"Successfully dumped {dumped_count} sessions.", file=sys.stderr)
+
+def show_timeline():
+    sessions = get_sessions()
+    if not sessions:
+        print("No sessions found.")
+        return
+
+    now = datetime.now()
+    today = now.date()
+    yesterday = today - timedelta(days=1)
+
+    groups = {
+        "TODAY": [],
+        "YESTERDAY": [],
+        "OLDER": {},
+        "LEGACY / UNKNOWN": []
+    }
+
+    for s in sessions:
+        updated_at = s["updated_at"]
+        if updated_at == 0:
+            groups["LEGACY / UNKNOWN"].append(s)
+            continue
+
+        dt = datetime.fromtimestamp(updated_at / 1000)
+        session_date = dt.date()
+
+        if session_date == today:
+            groups["TODAY"].append(s)
+        elif session_date == yesterday:
+            groups["YESTERDAY"].append(s)
+        else:
+            date_str = session_date.strftime("%Y-%m-%d")
+            if date_str not in groups["OLDER"]:
+                groups["OLDER"][date_str] = []
+            groups["OLDER"][date_str].append(s)
+
+    def print_group(name, group_sessions):
+        if not group_sessions:
+            return
+        print(f"\n{BOLD}{CYAN}=== {name} ({len(group_sessions)}) ==={RESET}")
+        for s in group_sessions:
+            # We use the display string but strip the active indicator for cleaner timeline
+            clean_display = s["display"]
+            if clean_display.startswith(GREEN + "●" + RESET):
+                clean_display = "  " + clean_display[len(GREEN + "●" + RESET):]
+            print(clean_display)
+
+    print_group("TODAY", groups["TODAY"])
+    print_group("YESTERDAY", groups["YESTERDAY"])
+
+    for date_str in sorted(groups["OLDER"].keys(), reverse=True):
+        print_group(date_str, groups["OLDER"][date_str])
+
+    print_group("LEGACY / UNKNOWN", groups["LEGACY / UNKNOWN"])
+
+def fork_session(conv_id, key):
+    if not conv_id or not key or conv_id == "NEW" or conv_id == "id":
+        return
+
+    if conv_id == "legacy":
+        print("Cannot fork legacy sessions.", file=sys.stderr)
+        return
+
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+
+    cursor.execute(
+        "SELECT value FROM conversations_v2 WHERE conversation_id = ? AND key = ?",
+        (conv_id, key)
+    )
+    row = cursor.fetchone()
+    if not row:
+        print(f"Session {conv_id} not found.", file=sys.stderr)
+        conn.close()
+        return
+
+    new_id = str(uuid.uuid4())
+    value = row[0]
+    now_ms = int(datetime.now().timestamp() * 1000)
+
+    cursor.execute(
+        "INSERT INTO conversations_v2 (key, conversation_id, value, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
+        (key, new_id, value, now_ms, now_ms)
+    )
+    conn.commit()
+    conn.close()
+    print(f"Forked session {conv_id} to {new_id}", file=sys.stderr)
+
+def new_session():
+    # Find directories that have been used for kiro sessions before
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("SELECT DISTINCT key FROM conversations_v2 UNION SELECT DISTINCT key FROM conversations")
+    keys = [r[0] for r in cursor.fetchall() if os.path.exists(r[0])]
+    conn.close()
+
+    if not keys:
+        print("No existing project directories found to start a new session in.", file=sys.stderr)
+        return
+
+    # Use fzf to pick a project directory
+    fzf_cmd = ["fzf", "--header", "Select project for NEW session", "--reverse"]
+    if is_fzf_tmux_supported():
+        fzf_cmd.append("--tmux")
+
+    try:
+        process = subprocess.Popen(
+            fzf_cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=sys.stderr,
+            text=True
+        )
+        stdout, _ = process.communicate(input="\n".join(keys))
+
+        if process.returncode != 0 or not stdout:
+            return
+
+        selected_key = stdout.strip()
+        print(f"cd {shlex.quote(selected_key)} && kiro-cli chat")
+    except Exception as e:
+        print(f"Error launching fzf: {e}", file=sys.stderr)
+
+def generate_report():
+    sessions = get_sessions()
+    if not sessions:
+        print("No sessions found.")
+        return
+
+    today = datetime.now().date()
+    activities = {}
+
+    for s in sessions:
+        updated_at = s["updated_at"]
+        if updated_at == 0: continue
+
+        dt = datetime.fromtimestamp(updated_at / 1000)
+        if dt.date() != today: continue
+
+        project = os.path.basename(s["key"])
+        if project not in activities:
+            activities[project] = []
+
+        data = s["data"]
+        summary = data.get("latest_summary")
+
+        if not summary:
+            # Try to get last user message
+            transcript = data.get("transcript", [])
+            for line in reversed(transcript):
+                stripped = line.strip()
+                if stripped.startswith("> "):
+                    content = stripped[2:].strip()
+                    if content.lower().startswith("user:"):
+                        content = content[5:].strip()
+                    summary = f"Discussed: {content}"
+                    break
+
+        if not summary:
+            summary = "Active session (no summary available)"
+
+        activities[project].append(summary)
+
+    if not activities:
+        print(f"No activity recorded for today ({today}).")
+        return
+
+    print(f"{BOLD}{BLUE}Daily Activity Report - {today}{RESET}")
+    print("=" * 40)
+
+    for project, summaries in activities.items():
+        print(f"\n{BOLD}{GREEN}[{project}]{RESET}")
+        for summary in summaries:
+            # Clean up multi-line summaries
+            clean_summary = summary.replace("\n", " ").strip()
+            print(f"  • {clean_summary}")
 
 def show_stats():
     sessions = get_sessions()
@@ -584,7 +803,18 @@ def main():
 
     parser_stats = subparsers.add_parser("stats", help="Show session statistics")
 
+    parser_timeline = subparsers.add_parser("timeline", help="Show session history grouped by date")
+
+    parser_report = subparsers.add_parser("report", help="Generate daily activity report")
+
+    parser_fork = subparsers.add_parser("fork", help="Fork a session")
+    parser_fork.add_argument("--id", required=True)
+    parser_fork.add_argument("--key", required=True)
+
+    parser_new = subparsers.add_parser("new", help="Start a new session in an existing project")
+
     parser_continue = subparsers.add_parser("continue", help="Resume the most recent session")
+    parser_continue.add_argument("--project", help="Resume most recent session for a project matching this query")
 
     parser_search = subparsers.add_parser("search", help="Search session transcripts")
     parser_search.add_argument("query", help="Search term")
@@ -620,15 +850,45 @@ def main():
         show_stats()
         return
 
+    if args.command == "timeline":
+        show_timeline()
+        return
+
+    if args.command == "report":
+        generate_report()
+        return
+
+    if args.command == "fork":
+        fork_session(args.id, args.key)
+        return
+
+    if args.command == "new":
+        new_session()
+        return
+
     if args.command == "continue":
         sessions = get_sessions()
-        if sessions:
+        if not sessions:
+            print("No sessions found.", file=sys.stderr)
+            return
+
+        selected = None
+        if args.project:
+            query = args.project.lower()
+            for s in sessions:
+                if query in os.path.basename(s["key"]).lower():
+                    selected = s
+                    break
+            if not selected:
+                print(f"No sessions found for project matching '{args.project}'", file=sys.stderr)
+                return
+        else:
             selected = sessions[0] # sessions are sorted by updated_at DESC
+
+        if selected:
             update_session(selected)
             safe_key = shlex.quote(selected['key'])
             print(f"cd {safe_key} && kiro-cli chat --resume")
-        else:
-            print("No sessions found.", file=sys.stderr)
         return
 
     if args.command == "search":
@@ -652,6 +912,10 @@ def main():
 
     selected = select_session(sessions)
     if selected:
+        if selected.get("is_new"):
+            new_session()
+            return
+
         if selected["pid"]:
             print(f"\n{BOLD}{YELLOW}Notice: Session is active (PID {selected['pid']}).{RESET}", file=sys.stderr)
             print(f"{DIM}Attempting to resume...{RESET}\n", file=sys.stderr)
