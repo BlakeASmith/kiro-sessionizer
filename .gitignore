@@ -1,4 +1,7 @@
-__pycache__/kiro_sessionizer.cpython-312.pyc
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
 kiro_sessionizer.egg-info/
 dist/
 build/
