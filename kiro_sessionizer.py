@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 import sqlite3
 import json
+import uuid
 import os
 import sys
 import subprocess
-from datetime import datetime
+from datetime import datetime, timedelta
 import re
 import glob
 
@@ -159,7 +160,9 @@ def get_sessions():
                 "id": conv_id,
                 "display": display,
                 "source": source,
-                "pid": pid
+                "pid": pid,
+                "updated_at": updated_at,
+                "data": data
             })
         except Exception:
             continue
@@ -196,8 +199,9 @@ def select_session(sessions):
         "--color", "header:italic:underline,pointer:bold:blue,marker:bold:green",
         "--preview", f"python3 {__file__} preview {{7}} {{9}} {{8}} {{2}}",
         "--bind", f"ctrl-x:execute(python3 {__file__} delete-multi {{+9}} --keys {{+7}})+reload(python3 {__file__} list)",
+        "--bind", f"ctrl-f:execute(python3 {__file__} fork --id {{9}} --key {{7}})+reload(python3 {__file__} list)",
         "--info", "inline",
-        "--footer", f"{DIM}ctrl-x: delete  tab: select multi{RESET}",
+        "--footer", f"{DIM}ctrl-x: delete  ctrl-f: fork  tab: select multi{RESET}",
     ])
 
     try:
@@ -507,6 +511,191 @@ def show_stats():
     for m, count in sorted(models.items(), key=lambda x: x[1], reverse=True):
         print(f"  {m:20} {count} sessions")
 
+def show_timeline():
+    sessions = get_sessions()
+    if not sessions:
+        print("No sessions found.")
+        return
+
+    from datetime import date
+    today = date.today()
+    yesterday = today - timedelta(days=1)
+
+    groups = {
+        "TODAY": [],
+        "YESTERDAY": [],
+        "OLDER": {}, # YYYY-MM-DD -> list
+        "LEGACY / UNKNOWN": []
+    }
+
+    for s in sessions:
+        updated_at = s.get("updated_at", 0)
+        if updated_at == 0:
+            groups["LEGACY / UNKNOWN"].append(s)
+            continue
+
+        dt = datetime.fromtimestamp(updated_at / 1000)
+        d = dt.date()
+
+        if d == today:
+            groups["TODAY"].append(s)
+        elif d == yesterday:
+            groups["YESTERDAY"].append(s)
+        else:
+            d_str = d.strftime("%Y-%m-%d")
+            if d_str not in groups["OLDER"]:
+                groups["OLDER"][d_str] = []
+            groups["OLDER"][d_str].append(s)
+
+    def print_group(name, group_sessions):
+        if not group_sessions: return
+        print(f"\n{BOLD}{BLUE}--- {name} ---{RESET}")
+        for s in group_sessions:
+            # Extract basic info from display but make it cleaner for timeline
+            parts = strip_ansi(s["display"]).split('\t')
+            project = parts[1]
+            time_str = datetime.fromtimestamp(s["updated_at"]/1000).strftime("%H:%M") if s["updated_at"] > 0 else "??:??"
+            msg_count = parts[4]
+            preview = parts[5]
+
+            # Try to get summary if exists
+            summary = s["data"].get("latest_summary")
+            content = summary if summary else preview
+            if len(content) > 100: content = content[:97] + "..."
+
+            print(f"  {YELLOW}{time_str}{RESET}  {BOLD}{project:20}{RESET} {MAGENTA}[{msg_count:2} msgs]{RESET} {content}")
+
+    print_group("TODAY", groups["TODAY"])
+    print_group("YESTERDAY", groups["YESTERDAY"])
+
+    for d_str in sorted(groups["OLDER"].keys(), reverse=True):
+        print_group(d_str, groups["OLDER"][d_str])
+
+    print_group("LEGACY / UNKNOWN", groups["LEGACY / UNKNOWN"])
+
+def generate_report():
+    sessions = get_sessions()
+    from datetime import date
+    today = date.today()
+
+    today_sessions = [s for s in sessions if s.get("updated_at", 0) > 0 and datetime.fromtimestamp(s["updated_at"]/1000).date() == today]
+
+    if not today_sessions:
+        print("No activity recorded for today.")
+        return
+
+    print(f"{BOLD}{GREEN}--- Daily Activity Report ({today.strftime('%Y-%m-%d')}) ---{RESET}\n")
+
+    project_groups = {}
+    for s in today_sessions:
+        project = os.path.basename(s["key"])
+        if project not in project_groups:
+            project_groups[project] = []
+        project_groups[project].append(s)
+
+    for project, p_sessions in sorted(project_groups.items()):
+        print(f"{BOLD}{BLUE}Project: {project}{RESET}")
+        # Sort by time ascending for the report
+        for s in sorted(p_sessions, key=lambda x: x["updated_at"]):
+            summary = s["data"].get("latest_summary")
+            if not summary:
+                # Fallback to last user message
+                transcript = s["data"].get("transcript", [])
+                for line in reversed(transcript):
+                    if line.strip().startswith("> "):
+                        summary = line.strip()[2:].strip()
+                        break
+
+            if not summary:
+                summary = "(No summary available)"
+
+            time_str = datetime.fromtimestamp(s["updated_at"]/1000).strftime("%H:%M")
+            print(f"  [{time_str}] {summary}")
+        print()
+
+def fork_session(conv_id, key):
+    if not os.path.exists(DB_PATH):
+        print(f"Error: Database not found at {DB_PATH}", file=sys.stderr)
+        return
+
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+
+    if conv_id == "legacy":
+        cursor.execute("SELECT value FROM conversations WHERE key = ?", (key,))
+    else:
+        cursor.execute(
+            "SELECT value FROM conversations_v2 WHERE conversation_id = ? AND key = ?",
+            (conv_id, key)
+        )
+
+    row = cursor.fetchone()
+    if not row:
+        print(f"Error: Session {conv_id} not found.", file=sys.stderr)
+        conn.close()
+        return
+
+    value = row[0]
+
+    # Create new session ID
+    new_conv_id = str(uuid.uuid4())
+    now_ms = int(datetime.now().timestamp() * 1000)
+
+    # Insert as new v2 session
+    cursor.execute(
+        "INSERT INTO conversations_v2 (key, conversation_id, value, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
+        (key, new_conv_id, value, now_ms, now_ms)
+    )
+
+    conn.commit()
+    conn.close()
+
+    print(f"Forked session {conv_id} into {new_conv_id}", file=sys.stderr)
+    safe_key = shlex.quote(key)
+    print(f"cd {safe_key} && kiro-cli chat --resume")
+
+def new_session():
+    # Fetch unique projects from BOTH v1 and v2 tables
+    if not os.path.exists(DB_PATH):
+        print(f"Error: Database not found at {DB_PATH}", file=sys.stderr)
+        return
+
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("SELECT DISTINCT key FROM conversations_v2 UNION SELECT DISTINCT key FROM conversations")
+    projects = [row[0] for row in cursor.fetchall() if row[0]]
+    conn.close()
+
+    if not projects:
+        print("No project history found.", file=sys.stderr)
+        return
+
+    projects.sort()
+    fzf_input = "\n".join(projects)
+
+    fzf_cmd = ["fzf", "--header", "Select Project for New Session", "--reverse"]
+    if is_fzf_tmux_supported():
+        fzf_cmd.append("--tmux")
+
+    try:
+        process = subprocess.Popen(
+            fzf_cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=sys.stderr,
+            text=True
+        )
+        stdout, _ = process.communicate(input=fzf_input)
+
+        if process.returncode != 0 or not stdout:
+            return
+
+        selected_path = stdout.strip()
+        safe_path = shlex.quote(selected_path)
+        print(f"cd {safe_path} && kiro-cli chat")
+    except FileNotFoundError:
+        print("Error: 'fzf' is not installed.", file=sys.stderr)
+
 def search_sessions(query):
     all_sessions = get_sessions()
     results = []
@@ -585,9 +774,19 @@ def main():
     parser_stats = subparsers.add_parser("stats", help="Show session statistics")
 
     parser_continue = subparsers.add_parser("continue", help="Resume the most recent session")
+    parser_continue.add_argument("--project", help="Substring of project name to filter by")
 
     parser_search = subparsers.add_parser("search", help="Search session transcripts")
     parser_search.add_argument("query", help="Search term")
+
+    subparsers.add_parser("timeline", help="Show chronological work history")
+    subparsers.add_parser("report", help="Generate daily activity report")
+
+    parser_fork = subparsers.add_parser("fork", help="Duplicate a session")
+    parser_fork.add_argument("--id", required=True, help="Session ID to fork")
+    parser_fork.add_argument("--key", required=True, help="Session project path")
+
+    subparsers.add_parser("new", help="Start a new session in an existing project")
 
     args = parser.parse_args()
 
@@ -622,13 +821,32 @@ def main():
 
     if args.command == "continue":
         sessions = get_sessions()
+        if args.project:
+            sessions = [s for s in sessions if args.project.lower() in os.path.basename(s["key"]).lower()]
+
         if sessions:
             selected = sessions[0] # sessions are sorted by updated_at DESC
             update_session(selected)
             safe_key = shlex.quote(selected['key'])
             print(f"cd {safe_key} && kiro-cli chat --resume")
         else:
-            print("No sessions found.", file=sys.stderr)
+            print(f"No sessions found{' for project ' + args.project if args.project else ''}.", file=sys.stderr)
+        return
+
+    if args.command == "timeline":
+        show_timeline()
+        return
+
+    if args.command == "report":
+        generate_report()
+        return
+
+    if args.command == "fork":
+        fork_session(args.id, args.key)
+        return
+
+    if args.command == "new":
+        new_session()
         return
 
     if args.command == "search":
