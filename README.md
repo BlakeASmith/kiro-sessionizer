@@ -15,6 +15,22 @@ kiro-sessionizer
 
 This opens `fzf` with a list of all available sessions. Select one to automatically navigate to its working directory and resume that specific session.
 
+### Subcommands
+
+- `timeline`: Show sessions grouped by date (TODAY, YESTERDAY, etc.).
+- `report`: Generate a daily activity report summarizing work across all projects.
+- `new`: Interactively select a project directory to start a fresh `kiro-cli chat` session.
+- `continue [--project <query>]`: Resume the most recent session, optionally filtered by project name.
+- `search <query>`: Search session transcripts and resume a matching session.
+- `stats`: Show session statistics (total sessions, message counts, model usage).
+- `backup <dest_dir>`: Dump sessions to Markdown files.
+
+### Interactive Shortcuts (in `fzf`)
+
+- `ctrl-f`: **Fork** the selected session (duplicate it and refresh the list).
+- `ctrl-x`: **Delete** the selected session(s).
+- `tab`: Select multiple sessions for deletion.
+
 ### Backing up Sessions
 
 You can dump all of your session transcripts into Markdown files using the `backup` subcommand. The command will recreate your file paths within the destination directory and populate the `.md` files with YAML frontmatter containing metadata about the session.
