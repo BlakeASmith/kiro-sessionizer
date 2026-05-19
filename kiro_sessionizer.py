@@ -4,9 +4,12 @@ import json
 import os
 import sys
 import subprocess
-from datetime import datetime
+from datetime import datetime, timedelta
 import re
 import glob
+import uuid
+import argparse
+import shlex
 
 DB_PATH = os.environ.get("KIRO_DB_PATH") or os.path.expanduser("~/Library/Application Support/kiro-cli/data.sqlite3")
 SESSIONS_DIR = os.environ.get("KIRO_SESSIONS_DIR") or os.path.expanduser("~/.kiro/sessions/cli")
@@ -84,28 +87,31 @@ def get_active_sessions():
     return active_paths
 
 
-def get_sessions():
+def get_sessions(include_data=False):
     if not os.path.exists(DB_PATH):
-        print(f"Error: Database not found at {DB_PATH}", file=sys.stderr)
-        sys.exit(1)
+        return []
 
     active_map = get_active_sessions()
     
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
     
-    query = """
-    SELECT key, conversation_id, value, updated_at, 'v2' as source
-    FROM conversations_v2
-    UNION ALL
-    SELECT key, 'legacy' as conversation_id, value, 0 as updated_at, 'v1' as source
-    FROM conversations
-    ORDER BY updated_at DESC;
-    """
+        query = """
+        SELECT key, conversation_id, value, updated_at, 'v2' as source
+        FROM conversations_v2
+        UNION ALL
+        SELECT key, 'legacy' as conversation_id, value, 0 as updated_at, 'v1' as source
+        FROM conversations
+        ORDER BY updated_at DESC;
+        """
     
-    cursor.execute(query)
-    rows = cursor.fetchall()
-    conn.close()
+        cursor.execute(query)
+        rows = cursor.fetchall()
+        conn.close()
+    except Exception as e:
+        print(f"Error fetching sessions: {e}", file=sys.stderr)
+        return []
     
     sessions = []
     for row in rows:
@@ -154,13 +160,18 @@ def get_sessions():
                 f"{conv_id}"
             )
             
-            sessions.append({
+            session_item = {
                 "key": key,
                 "id": conv_id,
                 "display": display,
                 "source": source,
-                "pid": pid
-            })
+                "pid": pid,
+                "updated_at": updated_at
+            }
+            if include_data:
+                session_item["data"] = data
+
+            sessions.append(session_item)
         except Exception:
             continue
             
@@ -182,6 +193,9 @@ def select_session(sessions):
     if is_fzf_tmux_supported():
         fzf_cmd.append("--tmux")
 
+    # Use shlex.quote for __file__ to handle spaces in path
+    quoted_file = shlex.quote(__file__)
+
     fzf_cmd.extend([
         "--ansi",
         "--delimiter", "\t",
@@ -194,10 +208,11 @@ def select_session(sessions):
         "--marker", "✓",
         "--multi",
         "--color", "header:italic:underline,pointer:bold:blue,marker:bold:green",
-        "--preview", f"python3 {__file__} preview {{7}} {{9}} {{8}} {{2}}",
-        "--bind", f"ctrl-x:execute(python3 {__file__} delete-multi {{+9}} --keys {{+7}})+reload(python3 {__file__} list)",
+        "--preview", f"python3 {quoted_file} preview {{7}} {{9}} {{8}} {{2}}",
+        "--bind", f"ctrl-x:execute(python3 {quoted_file} delete-multi {{+9}} --keys {{+7}})+reload(python3 {quoted_file} list)",
+        "--bind", f"ctrl-f:execute(python3 {quoted_file} fork {{9}} --key {{7}})+reload(python3 {quoted_file} list)",
         "--info", "inline",
-        "--footer", f"{DIM}ctrl-x: delete  tab: select multi{RESET}",
+        "--footer", f"{DIM}ctrl-x: delete  ctrl-f: fork  tab: select multi{RESET}",
     ])
 
     try:
@@ -233,55 +248,107 @@ def select_session(sessions):
 def delete_sessions(pairs):
     """pairs: list of (conv_id, key) tuples"""
     active_map = get_active_sessions()
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
 
-    for conv_id, key in pairs:
-        # Kill active process if any
-        pid = active_map.get(key)
-        if pid:
-            try:
-                os.kill(pid, 15)  # SIGTERM
-            except OSError:
-                pass
-
-        # Delete from DB
-        if conv_id == "legacy":
-            cursor.execute("DELETE FROM conversations WHERE key = ?", (key,))
-        else:
-            cursor.execute(
-                "DELETE FROM conversations_v2 WHERE conversation_id = ? AND key = ?",
-                (conv_id, key)
-            )
-
-        # Remove session files
-        if conv_id != "legacy":
-            for ext in (".json", ".lock"):
-                path = os.path.join(SESSIONS_DIR, conv_id + ext)
+        for conv_id, key in pairs:
+            # Kill active process if any
+            pid = active_map.get(key)
+            if pid:
                 try:
-                    os.remove(path)
+                    os.kill(pid, 15)  # SIGTERM
                 except OSError:
                     pass
 
-    conn.commit()
-    conn.close()
+            # Delete from DB
+            if conv_id == "legacy":
+                cursor.execute("DELETE FROM conversations WHERE key = ?", (key,))
+            else:
+                cursor.execute(
+                    "DELETE FROM conversations_v2 WHERE conversation_id = ? AND key = ?",
+                    (conv_id, key)
+                )
+
+            # Remove session files
+            if conv_id != "legacy":
+                for ext in (".json", ".lock"):
+                    path = os.path.join(SESSIONS_DIR, conv_id + ext)
+                    try:
+                        os.remove(path)
+                    except OSError:
+                        pass
+
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"Error deleting sessions: {e}", file=sys.stderr)
 
 
 def update_session(session):
     if session["source"] == "v1":
         return
 
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    
-    now_ms = int(datetime.now().timestamp() * 1000)
-    cursor.execute(
-        "UPDATE conversations_v2 SET updated_at = ? WHERE conversation_id = ? AND key = ?",
-        (now_ms, session["id"], session["key"])
-    )
-    
-    conn.commit()
-    conn.close()
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+
+        now_ms = int(datetime.now().timestamp() * 1000)
+        cursor.execute(
+            "UPDATE conversations_v2 SET updated_at = ? WHERE conversation_id = ? AND key = ?",
+            (now_ms, session["id"], session["key"])
+        )
+
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"Error updating session: {e}", file=sys.stderr)
+
+def fork_session(conv_id, key):
+    conv_id = strip_ansi(conv_id).strip()
+    key = strip_ansi(key).strip()
+
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+
+        if conv_id == "legacy":
+            cursor.execute("SELECT value FROM conversations WHERE key = ?", (key,))
+        else:
+            cursor.execute(
+                "SELECT value FROM conversations_v2 WHERE conversation_id = ? AND key = ?",
+                (conv_id, key)
+            )
+
+        row = cursor.fetchone()
+        if not row:
+            print(f"Error: Session {conv_id} not found.", file=sys.stderr)
+            conn.close()
+            return
+
+        data = json.loads(row[0])
+        new_id = str(uuid.uuid4())
+
+        # Update metadata in JSON
+        data["conversation_id"] = new_id
+        transcript = data.get("transcript", [])
+        transcript.append(f"\n[Session forked from {conv_id}]\n")
+        data["transcript"] = transcript
+
+        now_ms = int(datetime.now().timestamp() * 1000)
+
+        cursor.execute(
+            "INSERT INTO conversations_v2 (key, conversation_id, value, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
+            (key, new_id, json.dumps(data), now_ms, now_ms)
+        )
+
+        conn.commit()
+        conn.close()
+        print(f"Successfully forked session to {new_id}", file=sys.stderr)
+        return new_id
+    except Exception as e:
+        print(f"Error forking session: {e}", file=sys.stderr)
+        return None
 
 def run_preview(path_ansi, conv_id_ansi, pid_ansi, project_ansi):
     path = strip_ansi(path_ansi).strip()
@@ -289,19 +356,23 @@ def run_preview(path_ansi, conv_id_ansi, pid_ansi, project_ansi):
     pid = strip_ansi(pid_ansi).strip()
     project = strip_ansi(project_ansi).strip()
     
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
     
-    if conv_id == "legacy":
-        cursor.execute("SELECT value FROM conversations WHERE key = ?", (path,))
-    else:
-        cursor.execute(
-            "SELECT value FROM conversations_v2 WHERE conversation_id = ? AND key = ?",
-            (conv_id, path)
-        )
+        if conv_id == "legacy":
+            cursor.execute("SELECT value FROM conversations WHERE key = ?", (path,))
+        else:
+            cursor.execute(
+                "SELECT value FROM conversations_v2 WHERE conversation_id = ? AND key = ?",
+                (conv_id, path)
+            )
     
-    row = cursor.fetchone()
-    conn.close()
+        row = cursor.fetchone()
+        conn.close()
+    except Exception as e:
+        print(f"Error reading preview data: {e}")
+        return
         
     if not row:
         print(f"No detailed data for session {conv_id} at {path}")
@@ -373,29 +444,29 @@ def run_preview(path_ansi, conv_id_ansi, pid_ansi, project_ansi):
     except Exception as e:
         print(f"Error parsing preview: {e}")
 
-import argparse
-import shlex
-
 def dump_sessions(dest_dir, specific_session_id=None):
     if not os.path.exists(DB_PATH):
-        print(f"Error: Database not found at {DB_PATH}", file=sys.stderr)
         return
 
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
 
-    query = """
-    SELECT key, conversation_id, value, updated_at, 'v2' as source
-    FROM conversations_v2
-    UNION ALL
-    SELECT key, 'legacy' as conversation_id, value, 0 as updated_at, 'v1' as source
-    FROM conversations
-    ORDER BY updated_at DESC;
-    """
+        query = """
+        SELECT key, conversation_id, value, updated_at, 'v2' as source
+        FROM conversations_v2
+        UNION ALL
+        SELECT key, 'legacy' as conversation_id, value, 0 as updated_at, 'v1' as source
+        FROM conversations
+        ORDER BY updated_at DESC;
+        """
 
-    cursor.execute(query)
-    rows = cursor.fetchall()
-    conn.close()
+        cursor.execute(query)
+        rows = cursor.fetchall()
+        conn.close()
+    except Exception as e:
+        print(f"Error dumping sessions: {e}", file=sys.stderr)
+        return
 
     dumped_count = 0
     for row in rows:
@@ -459,6 +530,163 @@ def dump_sessions(dest_dir, specific_session_id=None):
 
     print(f"Successfully dumped {dumped_count} sessions.", file=sys.stderr)
 
+def show_timeline():
+    # include_data=True to avoid N+1 queries later
+    sessions = get_sessions(include_data=True)
+    if not sessions:
+        print("No sessions found.")
+        return
+
+    now = datetime.now()
+    today_str = now.strftime("%Y-%m-%d")
+    yesterday_str = (now - timedelta(days=1)).strftime("%Y-%m-%d")
+
+    groups = {
+        "TODAY": [],
+        "YESTERDAY": [],
+        "OLDER": {}
+    }
+
+    for s in sessions:
+        try:
+            updated_at_ms = s["updated_at"]
+            if updated_at_ms == 0:
+                dt = datetime.now()
+            else:
+                dt = datetime.fromtimestamp(updated_at_ms / 1000)
+
+            date_str = dt.strftime("%Y-%m-%d")
+            data = s.get("data", {})
+            summary = data.get("latest_summary")
+            transcript = data.get("transcript", [])
+            last_msg = ""
+            for line in reversed(transcript):
+                if line.strip() and line.strip().startswith("> "):
+                    last_msg = line.strip()[2:].strip()
+                    break
+
+            display_msg = summary if summary else last_msg
+            display_msg = (display_msg[:80] + "...") if len(display_msg) > 80 else display_msg
+
+            item = {
+                "project": os.path.basename(s["key"]),
+                "msg": display_msg,
+                "time": dt.strftime("%H:%M"),
+                "id": s["id"],
+                "key": s["key"]
+            }
+
+            if updated_at_ms == 0:
+                 if "LEGACY" not in groups: groups["LEGACY"] = []
+                 groups["LEGACY"].append(item)
+            elif date_str == today_str:
+                groups["TODAY"].append(item)
+            elif date_str == yesterday_str:
+                groups["YESTERDAY"].append(item)
+            else:
+                if date_str not in groups["OLDER"]:
+                    groups["OLDER"][date_str] = []
+                groups["OLDER"][date_str].append(item)
+        except Exception:
+            continue
+
+    def print_group(name, items):
+        if not items: return
+        print(f"\n{BOLD}{YELLOW}=== {name} ==={RESET}")
+        for item in items:
+            print(f"{CYAN}{item['time']}{RESET} {BOLD}{BLUE}{item['project']:15}{RESET} {item['msg']}")
+
+    print_group("TODAY", groups["TODAY"])
+    print_group("YESTERDAY", groups["YESTERDAY"])
+
+    for date in sorted(groups["OLDER"].keys(), reverse=True):
+        print_group(date, groups["OLDER"][date])
+
+    if "LEGACY" in groups:
+        print_group("LEGACY", groups["LEGACY"])
+
+def new_session():
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+
+        # Get unique projects
+        query = """
+        SELECT DISTINCT key FROM conversations_v2
+        UNION
+        SELECT DISTINCT key FROM conversations
+        """
+        cursor.execute(query)
+        projects = [row[0] for row in cursor.fetchall() if row[0]]
+        conn.close()
+
+        if not projects:
+            print("No existing projects found.", file=sys.stderr)
+            return
+
+        fzf_input = "\n".join(projects)
+        fzf_cmd = ["fzf", "--header", "Select a project to start a new session", "--reverse", "--height", "40%"]
+        if is_fzf_tmux_supported():
+            fzf_cmd.append("--tmux")
+
+        process = subprocess.Popen(
+            fzf_cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=sys.stderr,
+            text=True
+        )
+        stdout, _ = process.communicate(input=fzf_input)
+
+        if process.returncode == 0 and stdout:
+            path = stdout.strip()
+            print(f"cd {shlex.quote(path)} && kiro-cli chat")
+
+    except Exception as e:
+        print(f"Error starting new session: {e}", file=sys.stderr)
+
+def generate_report():
+    sessions = get_sessions(include_data=True)
+    now = datetime.now()
+    today_str = now.strftime("%Y-%m-%d")
+
+    report_items = {}
+
+    for s in sessions:
+        if s["id"] == "legacy": continue
+
+        updated_at_ms = s["updated_at"]
+        dt = datetime.fromtimestamp(updated_at_ms / 1000)
+        if dt.strftime("%Y-%m-%d") != today_str:
+            continue
+
+        data = s.get("data", {})
+        summary = data.get("latest_summary")
+        transcript = data.get("transcript", [])
+        last_msg = ""
+        for line in reversed(transcript):
+            if line.strip() and line.strip().startswith("> "):
+                last_msg = line.strip()[2:].strip()
+                break
+
+        project = os.path.basename(s["key"])
+        if project not in report_items:
+            report_items[project] = []
+
+        content = summary if summary else last_msg
+        if content:
+            report_items[project].append(content)
+
+    if not report_items:
+        print("No activity found for today.")
+        return
+
+    print(f"{BOLD}{GREEN}--- Daily Accomplishment Report ({today_str}) ---{RESET}")
+    for project, items in report_items.items():
+        print(f"\n{BOLD}{BLUE}[{project}]{RESET}")
+        for item in items:
+            print(f"  • {item}")
+
 def show_stats():
     sessions = get_sessions()
     if not sessions:
@@ -470,21 +698,21 @@ def show_stats():
     projects = {}
     total_msgs = 0
 
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
 
-    query = "SELECT value FROM conversations_v2 UNION ALL SELECT value FROM conversations"
-    cursor.execute(query)
-    for row in cursor.fetchall():
-        try:
-            data = json.loads(row[0])
-            model = data.get("model_info", {}).get("model_id", "unknown")
-            models[model] = models.get(model, 0) + 1
-
-            key = "unknown"
-            # We don't have the key directly here easily without more complex query but we can infer from sessions
-        except: continue
-    conn.close()
+        query = "SELECT value FROM conversations_v2 UNION ALL SELECT value FROM conversations"
+        cursor.execute(query)
+        for row in cursor.fetchall():
+            try:
+                data = json.loads(row[0])
+                model = data.get("model_info", {}).get("model_id", "unknown")
+                models[model] = models.get(model, 0) + 1
+            except: continue
+        conn.close()
+    except Exception:
+        pass
 
     for s in sessions:
         project = os.path.basename(s["key"])
@@ -511,53 +739,57 @@ def search_sessions(query):
     all_sessions = get_sessions()
     results = []
 
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
 
-    query_lower = query.lower()
+        query_lower = query.lower()
 
-    # Pre-filter using SQL LIKE for efficiency
-    sql_query = """
-    SELECT key, conversation_id FROM conversations_v2 WHERE value LIKE ?
-    UNION ALL
-    SELECT key, 'legacy' FROM conversations WHERE value LIKE ?
-    """
-    cursor.execute(sql_query, (f"%{query}%", f"%{query}%"))
-    matches = set(cursor.fetchall())
+        # Pre-filter using SQL LIKE for efficiency
+        sql_query = """
+        SELECT key, conversation_id FROM conversations_v2 WHERE value LIKE ?
+        UNION ALL
+        SELECT key, 'legacy' FROM conversations WHERE value LIKE ?
+        """
+        cursor.execute(sql_query, (f"%{query}%", f"%{query}%"))
+        matches = set(cursor.fetchall())
 
-    for s in all_sessions:
-        if (s["key"], s["id"]) not in matches:
-            continue
+        for s in all_sessions:
+            if (s["key"], s["id"]) not in matches:
+                continue
 
-        # Get full data to extract snippet
-        if s["id"] == "legacy":
-            cursor.execute("SELECT value FROM conversations WHERE key = ?", (s["key"],))
-        else:
-            cursor.execute("SELECT value FROM conversations_v2 WHERE conversation_id = ? AND key = ?", (s["id"], s["key"]))
+            # Get full data to extract snippet
+            if s["id"] == "legacy":
+                cursor.execute("SELECT value FROM conversations WHERE key = ?", (s["key"],))
+            else:
+                cursor.execute("SELECT value FROM conversations_v2 WHERE conversation_id = ? AND key = ?", (s["id"], s["key"]))
 
-        row = cursor.fetchone()
-        if not row: continue
+            row = cursor.fetchone()
+            if not row: continue
 
-        data = json.loads(row[0])
-        transcript_text = " ".join(data.get("transcript", []))
-        summary_text = data.get("latest_summary", "")
-        full_text = transcript_text + " " + summary_text
+            data = json.loads(row[0])
+            transcript_text = " ".join(data.get("transcript", []))
+            summary_text = data.get("latest_summary", "")
+            full_text = transcript_text + " " + summary_text
 
-        if query_lower in full_text.lower():
-            # Find a snippet from original text
-            idx = full_text.lower().find(query_lower)
-            start = max(0, idx - 40)
-            end = min(len(full_text), idx + 60)
-            snippet = full_text[start:end].replace("\n", " ")
+            if query_lower in full_text.lower():
+                # Find a snippet from original text
+                idx = full_text.lower().find(query_lower)
+                start = max(0, idx - 40)
+                end = min(len(full_text), idx + 60)
+                snippet = full_text[start:end].replace("\n", " ")
 
-            # Update display to include snippet
-            parts = s["display"].split('\t')
-            # 1:icon, 2:proj, 3:date, 4:model, 5:msgs, 6:preview, 7:key, 8:pid, 9:conv_id
-            parts[5] = f"{YELLOW}...{snippet}...{RESET}"
-            s["display"] = "\t".join(parts)
-            results.append(s)
+                # Update display to include snippet
+                parts = s["display"].split('\t')
+                # 1:icon, 2:proj, 3:date, 4:model, 5:msgs, 6:preview, 7:key, 8:pid, 9:conv_id
+                parts[5] = f"{YELLOW}...{snippet}...{RESET}"
+                s["display"] = "\t".join(parts)
+                results.append(s)
 
-    conn.close()
+        conn.close()
+    except Exception as e:
+        print(f"Error searching sessions: {e}", file=sys.stderr)
+
     return results
 
 def main():
@@ -573,6 +805,10 @@ def main():
 
     parser_list = subparsers.add_parser("list", help=argparse.SUPPRESS)
 
+    parser_fork = subparsers.add_parser("fork", help="Fork a session")
+    parser_fork.add_argument("conv_id")
+    parser_fork.add_argument("--key", required=True)
+
     parser_delete = subparsers.add_parser("delete-multi", help=argparse.SUPPRESS)
     parser_delete.add_argument("ids_str")
     parser_delete.add_argument("--keys", required=True, dest="keys_str")
@@ -584,7 +820,14 @@ def main():
 
     parser_stats = subparsers.add_parser("stats", help="Show session statistics")
 
+    parser_timeline = subparsers.add_parser("timeline", help="Show chronological session history")
+
+    parser_report = subparsers.add_parser("report", help="Generate a daily activity report")
+
     parser_continue = subparsers.add_parser("continue", help="Resume the most recent session")
+    parser_continue.add_argument("--project", help="Case-insensitive project name substring to match")
+
+    parser_new = subparsers.add_parser("new", help="Start a new session in a known project directory")
 
     parser_search = subparsers.add_parser("search", help="Search session transcripts")
     parser_search.add_argument("query", help="Search term")
@@ -598,6 +841,10 @@ def main():
     if args.command == "list":
         sessions = get_sessions()
         print("\n".join([s["display"] for s in sessions]))
+        return
+
+    if args.command == "fork":
+        fork_session(args.conv_id, args.key)
         return
 
     if args.command == "delete-multi":
@@ -620,15 +867,40 @@ def main():
         show_stats()
         return
 
+    if args.command == "timeline":
+        show_timeline()
+        return
+
+    if args.command == "report":
+        generate_report()
+        return
+
+    if args.command == "new":
+        new_session()
+        return
+
     if args.command == "continue":
         sessions = get_sessions()
-        if sessions:
-            selected = sessions[0] # sessions are sorted by updated_at DESC
-            update_session(selected)
-            safe_key = shlex.quote(selected['key'])
-            print(f"cd {safe_key} && kiro-cli chat --resume")
-        else:
+        if not sessions:
             print("No sessions found.", file=sys.stderr)
+            return
+
+        selected = None
+        if args.project:
+            query = args.project.lower()
+            for s in sessions:
+                if query in s["key"].lower():
+                    selected = s
+                    break
+            if not selected:
+                print(f"No session found matching project '{args.project}'", file=sys.stderr)
+                return
+        else:
+            selected = sessions[0] # sessions are sorted by updated_at DESC
+
+        update_session(selected)
+        safe_key = shlex.quote(selected['key'])
+        print(f"cd {safe_key} && kiro-cli chat --resume")
         return
 
     if args.command == "search":
