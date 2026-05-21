@@ -7,6 +7,7 @@ import subprocess
 from datetime import datetime
 import re
 import glob
+import uuid
 
 DB_PATH = os.environ.get("KIRO_DB_PATH") or os.path.expanduser("~/Library/Application Support/kiro-cli/data.sqlite3")
 SESSIONS_DIR = os.environ.get("KIRO_SESSIONS_DIR") or os.path.expanduser("~/.kiro/sessions/cli")
@@ -196,8 +197,9 @@ def select_session(sessions):
         "--color", "header:italic:underline,pointer:bold:blue,marker:bold:green",
         "--preview", f"python3 {__file__} preview {{7}} {{9}} {{8}} {{2}}",
         "--bind", f"ctrl-x:execute(python3 {__file__} delete-multi {{+9}} --keys {{+7}})+reload(python3 {__file__} list)",
+        "--bind", f"ctrl-f:execute(python3 {__file__} fork --id {{9}} --key {{7}})+reload(python3 {__file__} list)",
         "--info", "inline",
-        "--footer", f"{DIM}ctrl-x: delete  tab: select multi{RESET}",
+        "--footer", f"{DIM}ctrl-x: delete  ctrl-f: fork  tab: select multi{RESET}",
     ])
 
     try:
@@ -282,6 +284,110 @@ def update_session(session):
     
     conn.commit()
     conn.close()
+
+def new_session():
+    if not os.path.exists(DB_PATH):
+        print(f"Error: Database not found at {DB_PATH}", file=sys.stderr)
+        return
+
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+
+    # Get unique project paths
+    cursor.execute("SELECT DISTINCT key FROM conversations_v2 UNION SELECT DISTINCT key FROM conversations")
+    paths = [row[0] for row in cursor.fetchall() if row[0]]
+    conn.close()
+
+    if not paths:
+        print("No existing projects found in database.", file=sys.stderr)
+        return
+
+    # Use fzf to select a project
+    fzf_input = "\n".join(paths)
+    fzf_cmd = ["fzf", "--header", "Select project for a new session", "--reverse", "--height", "40%"]
+    if is_fzf_tmux_supported():
+        fzf_cmd.append("--tmux")
+
+    try:
+        process = subprocess.Popen(
+            fzf_cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=sys.stderr,
+            text=True
+        )
+        stdout, _ = process.communicate(input=fzf_input)
+
+        if process.returncode == 0 and stdout:
+            selected_path = stdout.strip()
+            safe_key = shlex.quote(selected_path)
+            print(f"cd {safe_key} && kiro-cli chat")
+    except Exception as e:
+        print(f"Error in project selection: {e}", file=sys.stderr)
+
+def fork_session(source_id, source_key):
+    if not os.path.exists(DB_PATH):
+        print(f"Error: Database not found at {DB_PATH}", file=sys.stderr)
+        return None
+
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+
+    # Get source session
+    if source_id == "legacy":
+        cursor.execute("SELECT value FROM conversations WHERE key = ?", (source_key,))
+    else:
+        cursor.execute(
+            "SELECT value FROM conversations_v2 WHERE conversation_id = ? AND key = ?",
+            (source_id, source_key)
+        )
+
+    row = cursor.fetchone()
+    if not row:
+        conn.close()
+        print(f"Error: Source session {source_id} not found.", file=sys.stderr)
+        return None
+
+    try:
+        data = json.loads(row[0])
+        new_id = str(uuid.uuid4())
+        data["conversation_id"] = new_id
+
+        # Add fork marker to transcript
+        if "transcript" in data:
+            data["transcript"].append(f"[Session forked from {source_id}]")
+
+        new_value = json.dumps(data)
+        now_ms = int(datetime.now().timestamp() * 1000)
+
+        # Insert into DB
+        cursor.execute(
+            "INSERT INTO conversations_v2 (key, conversation_id, value, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
+            (source_key, new_id, new_value, now_ms, now_ms)
+        )
+
+        # Try to copy the JSON file if it exists
+        if source_id != "legacy":
+            source_file = os.path.join(SESSIONS_DIR, source_id + ".json")
+            if os.path.exists(source_file):
+                dest_file = os.path.join(SESSIONS_DIR, new_id + ".json")
+                try:
+                    with open(source_file, 'r') as f:
+                        file_data = json.load(f)
+                    file_data["conversation_id"] = new_id
+                    with open(dest_file, 'w') as f:
+                        json.dump(file_data, f)
+                except Exception as e:
+                    print(f"Warning: Could not copy session file: {e}", file=sys.stderr)
+
+        conn.commit()
+        conn.close()
+        print(f"Successfully forked session {source_id} to {new_id}", file=sys.stderr)
+        return new_id
+    except Exception as e:
+        conn.close()
+        print(f"Error forking session: {e}", file=sys.stderr)
+        return None
 
 def run_preview(path_ansi, conv_id_ansi, pid_ansi, project_ansi):
     path = strip_ansi(path_ansi).strip()
@@ -589,6 +695,12 @@ def main():
     parser_search = subparsers.add_parser("search", help="Search session transcripts")
     parser_search.add_argument("query", help="Search term")
 
+    parser_fork = subparsers.add_parser("fork", help="Fork an existing session")
+    parser_fork.add_argument("--id", required=True)
+    parser_fork.add_argument("--key", required=True)
+
+    parser_new = subparsers.add_parser("new", help="Start a new session in an existing project")
+
     args = parser.parse_args()
 
     if args.command == "preview":
@@ -642,6 +754,17 @@ def main():
             update_session(selected)
             safe_key = shlex.quote(selected['key'])
             print(f"cd {safe_key} && kiro-cli chat --resume")
+        return
+
+    if args.command == "fork":
+        new_id = fork_session(args.id, args.key)
+        if new_id:
+            safe_key = shlex.quote(args.key)
+            print(f"cd {safe_key} && kiro-cli chat --resume")
+        return
+
+    if args.command == "new":
+        new_session()
         return
 
     # Interactive picker mode
