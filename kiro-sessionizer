@@ -10,15 +10,18 @@ if [ $# -eq 0 ]; then
         eval "$COMMAND"
     fi
 else
-    # Check if the subcommand might return a resume command (search or continue)
+    # Check if the subcommand might return a resume command (search, continue, or new)
     case "$1" in
-        search|continue)
+        search|continue|new)
             COMMAND=$(kiro_sessionizer "$@")
             if [[ "$COMMAND" == cd\ * ]]; then
                 eval "$COMMAND"
             else
                 echo "$COMMAND"
             fi
+            ;;
+        timeline|report|stats|fork)
+            kiro_sessionizer "$@"
             ;;
         *)
             kiro_sessionizer "$@"
