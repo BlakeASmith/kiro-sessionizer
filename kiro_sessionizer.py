@@ -4,9 +4,12 @@ import json
 import os
 import sys
 import subprocess
-from datetime import datetime
+from datetime import datetime, timedelta
 import re
 import glob
+import uuid
+import shlex
+import argparse
 
 DB_PATH = os.environ.get("KIRO_DB_PATH") or os.path.expanduser("~/Library/Application Support/kiro-cli/data.sqlite3")
 SESSIONS_DIR = os.environ.get("KIRO_SESSIONS_DIR") or os.path.expanduser("~/.kiro/sessions/cli")
@@ -21,6 +24,7 @@ RED = "\033[31m"
 BOLD = "\033[1m"
 DIM = "\033[2m"
 ITALIC = "\033[3m"
+UNDERLINE = "\033[4m"
 RESET = "\033[0m"
 
 def strip_ansi(text):
@@ -59,25 +63,37 @@ def get_active_sessions():
             except Exception:
                 continue
 
-    # Method 2: Fallback for non-interactive/hidden sessions (ps + lsof)
+    # Method 2: Fallback for non-interactive/hidden sessions (pgrep + batched lsof)
     try:
-        # Get PIDs of all processes whose command line contains 'kiro-cli'
-        ps_cmd = ["pgrep", "-f", "kiro-cli"]
-        pids = subprocess.check_output(ps_cmd, text=True).strip().split('\n')
+        # Get PIDs of all processes whose command line contains 'kiro-cli' or 'bun'
+        pids = []
+        try:
+            pids.extend(subprocess.check_output(["pgrep", "-f", "kiro-cli"], text=True).strip().split('\n'))
+        except subprocess.CalledProcessError: pass
+        try:
+            pids.extend(subprocess.check_output(["pgrep", "-f", "bun"], text=True).strip().split('\n'))
+        except subprocess.CalledProcessError: pass
 
+        valid_pids = []
         for pid_str in pids:
             if not pid_str: continue
             pid = int(pid_str)
-            if pid in active_paths.values(): continue # Already found via lock
+            if pid not in active_paths.values():
+                valid_pids.append(str(pid))
 
-            # Use lsof to find the CWD of the process
-            lsof_cmd = ["lsof", "-a", "-p", str(pid), "-d", "cwd", "-Fn"]
+        if valid_pids:
+            # Batch lsof call for all PIDs
+            lsof_cmd = ["lsof", "-a", "-p", ",".join(valid_pids), "-d", "cwd", "-Fn"]
             lsof_out = subprocess.check_output(lsof_cmd, text=True)
+
+            current_pid = None
             for line in lsof_out.split('\n'):
-                if line.startswith('n'):
+                if line.startswith('p'):
+                    current_pid = int(line[1:])
+                elif line.startswith('n') and current_pid:
                     cwd = line[1:].strip()
                     if cwd and cwd not in active_paths:
-                        active_paths[cwd] = pid
+                        active_paths[cwd] = current_pid
     except Exception:
         pass # Fallback failed, ignore
 
@@ -159,7 +175,12 @@ def get_sessions():
                 "id": conv_id,
                 "display": display,
                 "source": source,
-                "pid": pid
+                "pid": pid,
+                "updated_at": updated_at,
+                "data": data,
+                "project": project,
+                "last_user_msg": first_user_msg,
+                "preview": preview
             })
         except Exception:
             continue
@@ -175,8 +196,39 @@ def is_fzf_tmux_supported():
     except Exception:
         return False
 
-def select_session(sessions):
-    fzf_input = "\n".join([s["display"] for s in sessions])
+def select_session(sessions, show_timeline_view=False):
+    if show_timeline_view:
+        timeline_items = []
+        now = datetime.now()
+        today = now.date()
+        yesterday = today - timedelta(days=1)
+
+        groups = {"TODAY": [], "YESTERDAY": [], "OLDER": [], "LEGACY": []}
+
+        for s in sessions:
+            if s["updated_at"] == 0:
+                groups["LEGACY"].append(s)
+                continue
+
+            dt = datetime.fromtimestamp(s["updated_at"] / 1000).date()
+            if dt == today:
+                groups["TODAY"].append(s)
+            elif dt == yesterday:
+                groups["YESTERDAY"].append(s)
+            else:
+                groups["OLDER"].append(s)
+
+        # Build fzf input with headers
+        for label in ["TODAY", "YESTERDAY", "OLDER", "LEGACY"]:
+            if groups[label]:
+                header = f"{BOLD}{UNDERLINE}{label}{RESET}\t\t\t\t\t\t\t\t"
+                timeline_items.append(header)
+                for s in groups[label]:
+                    timeline_items.append(s["display"])
+
+        fzf_input = "\n".join(timeline_items)
+    else:
+        fzf_input = "\n".join([s["display"] for s in sessions])
     
     fzf_cmd = ["fzf"]
     if is_fzf_tmux_supported():
@@ -194,10 +246,11 @@ def select_session(sessions):
         "--marker", "✓",
         "--multi",
         "--color", "header:italic:underline,pointer:bold:blue,marker:bold:green",
-        "--preview", f"python3 {__file__} preview {{7}} {{9}} {{8}} {{2}}",
-        "--bind", f"ctrl-x:execute(python3 {__file__} delete-multi {{+9}} --keys {{+7}})+reload(python3 {__file__} list)",
+        "--preview", f"python3 {shlex.quote(__file__)} preview {{7}} {{9}} {{8}} {{2}}",
+        "--bind", f"ctrl-x:execute(python3 {shlex.quote(__file__)} delete-multi {{+9}} --keys {{+7}})+reload(python3 {shlex.quote(__file__)} list)",
+        "--bind", f"ctrl-f:execute(python3 {shlex.quote(__file__)} fork --id {{9}} --key {{7}})+reload(python3 {shlex.quote(__file__)} list)",
         "--info", "inline",
-        "--footer", f"{DIM}ctrl-x: delete  tab: select multi{RESET}",
+        "--footer", f"{DIM}ctrl-x: delete  ctrl-f: fork  tab: select multi{RESET}",
     ])
 
     try:
@@ -221,6 +274,9 @@ def select_session(sessions):
         selected_display = selected_lines[0]
         stripped_selected = strip_ansi(selected_display)
         
+        if not stripped_selected.strip():
+            return None
+
         for s in sessions:
             if strip_ansi(s["display"]) == stripped_selected:
                 return s
@@ -283,9 +339,55 @@ def update_session(session):
     conn.commit()
     conn.close()
 
+def fork_session(conv_id, key):
+    if conv_id == "legacy":
+        print("Cannot fork legacy sessions.", file=sys.stderr)
+        return None
+
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+
+    cursor.execute(
+        "SELECT value FROM conversations_v2 WHERE conversation_id = ? AND key = ?",
+        (conv_id, key)
+    )
+    row = cursor.fetchone()
+    if not row:
+        conn.close()
+        print(f"Session {conv_id} not found.", file=sys.stderr)
+        return None
+
+    try:
+        data = json.loads(row[0])
+        new_id = str(uuid.uuid4())
+        now_ms = int(datetime.now().timestamp() * 1000)
+
+        # Update metadata in JSON
+        data["conversation_id"] = new_id
+        if "transcript" in data:
+            data["transcript"].append(f"[Session forked from {conv_id}]")
+
+        new_value = json.dumps(data)
+
+        cursor.execute(
+            "INSERT INTO conversations_v2 (key, conversation_id, value, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
+            (key, new_id, new_value, now_ms, now_ms)
+        )
+        conn.commit()
+        conn.close()
+        print(f"Forked session {conv_id} to {new_id}", file=sys.stderr)
+        return new_id
+    except Exception as e:
+        conn.close()
+        print(f"Error forking session: {e}", file=sys.stderr)
+        return None
+
 def run_preview(path_ansi, conv_id_ansi, pid_ansi, project_ansi):
     path = strip_ansi(path_ansi).strip()
     conv_id = strip_ansi(conv_id_ansi).strip()
+
+    if not conv_id or not path:
+        return
     pid = strip_ansi(pid_ansi).strip()
     project = strip_ansi(project_ansi).strip()
     
@@ -507,6 +609,76 @@ def show_stats():
     for m, count in sorted(models.items(), key=lambda x: x[1], reverse=True):
         print(f"  {m:20} {count} sessions")
 
+def generate_report():
+    sessions = get_sessions()
+    today = datetime.now().date()
+
+    today_sessions = [s for s in sessions if s["updated_at"] > 0 and datetime.fromtimestamp(s["updated_at"] / 1000).date() == today]
+
+    if not today_sessions:
+        print("No activity recorded for today.")
+        return
+
+    print(f"{BOLD}{BLUE}--- Daily Kiro Activity Report ({today}) ---{RESET}\n")
+
+    # Group by project
+    by_project = {}
+    for s in today_sessions:
+        proj = s["project"]
+        if proj not in by_project:
+            by_project[proj] = []
+        by_project[proj].append(s)
+
+    for proj, projsessions in by_project.items():
+        print(f"{BOLD}{CYAN}Project: {proj}{RESET}")
+        for s in projsessions:
+            summary = s["data"].get("latest_summary")
+            if not summary:
+                summary = s["last_user_msg"] if s["last_user_msg"] else s["preview"]
+
+            time_str = datetime.fromtimestamp(s["updated_at"] / 1000).strftime("%H:%M")
+            print(f"  {DIM}[{time_str}]{RESET} {summary}")
+        print()
+
+def new_session():
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+
+    # Get all unique project paths from both tables
+    query = """
+    SELECT DISTINCT key FROM conversations_v2
+    UNION
+    SELECT DISTINCT key FROM conversations
+    """
+    cursor.execute(query)
+    paths = [row[0] for row in cursor.fetchall()]
+    conn.close()
+
+    if not paths:
+        print("No existing projects found in history.", file=sys.stderr)
+        return
+
+    fzf_input = "\n".join(paths)
+    fzf_cmd = ["fzf", "--header", "Select project to start a new chat session"]
+    if is_fzf_tmux_supported():
+        fzf_cmd.append("--tmux")
+
+    try:
+        process = subprocess.Popen(
+            fzf_cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=sys.stderr,
+            text=True
+        )
+        stdout, _ = process.communicate(input=fzf_input)
+
+        if process.returncode == 0 and stdout:
+            selected_path = stdout.strip()
+            print(f"cd {shlex.quote(selected_path)} && kiro-cli chat")
+    except Exception as e:
+        print(f"Error selecting project: {e}", file=sys.stderr)
+
 def search_sessions(query):
     all_sessions = get_sessions()
     results = []
@@ -577,6 +749,10 @@ def main():
     parser_delete.add_argument("ids_str")
     parser_delete.add_argument("--keys", required=True, dest="keys_str")
 
+    parser_fork = subparsers.add_parser("fork", help=argparse.SUPPRESS)
+    parser_fork.add_argument("--id", required=True)
+    parser_fork.add_argument("--key", required=True)
+
     # User subcommands
     parser_backup = subparsers.add_parser("backup", help="Dump sessions to markdown files")
     parser_backup.add_argument("dest_dir", help="Directory to dump session markdown files into")
@@ -584,7 +760,14 @@ def main():
 
     parser_stats = subparsers.add_parser("stats", help="Show session statistics")
 
+    parser_timeline = subparsers.add_parser("timeline", help="Show chronological session history")
+
+    parser_report = subparsers.add_parser("report", help="Generate daily activity report")
+
     parser_continue = subparsers.add_parser("continue", help="Resume the most recent session")
+    parser_continue.add_argument("--project", help="Resume most recent session for a project matching query")
+
+    parser_new = subparsers.add_parser("new", help="Start a new session in an existing project")
 
     parser_search = subparsers.add_parser("search", help="Search session transcripts")
     parser_search.add_argument("query", help="Search term")
@@ -612,6 +795,10 @@ def main():
             pass
         return
 
+    if args.command == "fork":
+        fork_session(args.id, args.key)
+        return
+
     if args.command == "backup":
         dump_sessions(args.dest_dir, args.session_id)
         return
@@ -620,15 +807,44 @@ def main():
         show_stats()
         return
 
+    if args.command == "timeline":
+        sessions = get_sessions()
+        selected = select_session(sessions, show_timeline_view=True)
+        if selected:
+            update_session(selected)
+            safe_key = shlex.quote(selected['key'])
+            print(f"cd {safe_key} && kiro-cli chat --resume")
+        return
+
+    if args.command == "report":
+        generate_report()
+        return
+
     if args.command == "continue":
         sessions = get_sessions()
         if sessions:
-            selected = sessions[0] # sessions are sorted by updated_at DESC
+            selected = None
+            if args.project:
+                query = args.project.lower()
+                for s in sessions:
+                    if query in s["key"].lower():
+                        selected = s
+                        break
+                if not selected:
+                    print(f"No project matching '{args.project}' found.", file=sys.stderr)
+                    return
+            else:
+                selected = sessions[0] # sessions are sorted by updated_at DESC
+
             update_session(selected)
             safe_key = shlex.quote(selected['key'])
             print(f"cd {safe_key} && kiro-cli chat --resume")
         else:
             print("No sessions found.", file=sys.stderr)
+        return
+
+    if args.command == "new":
+        new_session()
         return
 
     if args.command == "search":
