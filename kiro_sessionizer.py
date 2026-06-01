@@ -84,6 +84,71 @@ def get_active_sessions():
     return active_paths
 
 
+def get_unique_directories():
+    if not os.path.exists(DB_PATH):
+        print(f"Error: Database not found at {DB_PATH}", file=sys.stderr)
+        sys.exit(1)
+
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+
+    query = """
+    SELECT key, MAX(updated_at) as last_active
+    FROM (
+        SELECT key, updated_at FROM conversations_v2
+        UNION ALL
+        SELECT key, 0 as updated_at FROM conversations
+    )
+    GROUP BY key
+    ORDER BY last_active DESC;
+    """
+    cursor.execute(query)
+    rows = cursor.fetchall()
+    conn.close()
+
+    dirs = []
+    for row in rows:
+        key, last_active = row
+        project = os.path.basename(key.rstrip(os.sep))
+        dt = datetime.fromtimestamp(last_active / 1000) if last_active > 0 else datetime.now()
+        date_str = dt.strftime("%Y-%m-%d %H:%M")
+
+        display = f"{BOLD}{BLUE}{project:20}{RESET}\t{YELLOW}{date_str}{RESET}\t{GREEN}{key}{RESET}"
+        dirs.append({"key": key, "display": display})
+    return dirs
+
+def select_directory(dirs):
+    fzf_input = "\n".join([d["display"] for d in dirs])
+
+    fzf_cmd = ["fzf", "--ansi", "--delimiter", "\t", "--with-nth", "1,3", "--reverse"]
+    if is_fzf_tmux_supported():
+        fzf_cmd.append("--tmux")
+
+    try:
+        process = subprocess.Popen(
+            fzf_cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=sys.stderr,
+            text=True
+        )
+        stdout, _ = process.communicate(input=fzf_input)
+
+        if process.returncode != 0 or not stdout:
+            return None
+
+        selected_display = stdout.strip()
+        stripped_selected = strip_ansi(selected_display)
+
+        for d in dirs:
+            if strip_ansi(d["display"]) == stripped_selected:
+                return d
+    except FileNotFoundError:
+        print("Error: 'fzf' is not installed.", file=sys.stderr)
+        sys.exit(1)
+
+    return None
+
 def get_sessions():
     if not os.path.exists(DB_PATH):
         print(f"Error: Database not found at {DB_PATH}", file=sys.stderr)
@@ -266,6 +331,54 @@ def delete_sessions(pairs):
     conn.commit()
     conn.close()
 
+
+def prune_sessions(days=30, min_messages=0, force=False):
+    if not os.path.exists(DB_PATH):
+        print(f"Error: Database not found at {DB_PATH}", file=sys.stderr)
+        return
+
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+
+    # Calculate cutoff time
+    cutoff_ms = int((datetime.now().timestamp() - (days * 86400)) * 1000)
+
+    # Find sessions to prune
+    query = """
+    SELECT key, conversation_id, value, updated_at
+    FROM conversations_v2
+    WHERE updated_at < ?
+    """
+    cursor.execute(query, (cutoff_ms,))
+    rows = cursor.fetchall()
+
+    to_delete = []
+    for row in rows:
+        key, conv_id, value, updated_at = row
+        try:
+            data = json.loads(value)
+            history = data.get("history", [])
+            if len(history) <= min_messages:
+                to_delete.append((conv_id, key, len(history)))
+        except Exception:
+            continue
+
+    if not to_delete:
+        print("No sessions found to prune.")
+        conn.close()
+        return
+
+    print(f"{BOLD}{RED}Found {len(to_delete)} sessions to prune:{RESET}")
+    for conv_id, key, msgs in to_delete:
+        print(f"  {DIM}{conv_id}{RESET} at {BLUE}{key}{RESET} ({msgs} messages)")
+
+    if force:
+        delete_sessions([(cid, k) for cid, k, m in to_delete])
+        print(f"\n{GREEN}Successfully pruned {len(to_delete)} sessions.{RESET}")
+    else:
+        print(f"\n{YELLOW}Dry run: Use --force to actually delete these sessions.{RESET}")
+
+    conn.close()
 
 def update_session(session):
     if session["source"] == "v1":
@@ -468,6 +581,7 @@ def show_stats():
     total = len(sessions)
     models = {}
     projects = {}
+    files = {}
     total_msgs = 0
 
     conn = sqlite3.connect(DB_PATH)
@@ -481,8 +595,10 @@ def show_stats():
             model = data.get("model_info", {}).get("model_id", "unknown")
             models[model] = models.get(model, 0) + 1
 
-            key = "unknown"
-            # We don't have the key directly here easily without more complex query but we can infer from sessions
+            # Extract file insights from file_line_tracker
+            tracker = data.get("file_line_tracker", {})
+            for filepath in tracker.get("files", {}):
+                files[filepath] = files.get(filepath, 0) + 1
         except: continue
     conn.close()
 
@@ -506,6 +622,11 @@ def show_stats():
     print(f"\n{BOLD}Model Usage:{RESET}")
     for m, count in sorted(models.items(), key=lambda x: x[1], reverse=True):
         print(f"  {m:20} {count} sessions")
+
+    if files:
+        print(f"\n{BOLD}Top Files Discussed:{RESET}")
+        for f, count in sorted(files.items(), key=lambda x: x[1], reverse=True)[:10]:
+            print(f"  {os.path.basename(f):25} {count} sessions {DIM}({f}){RESET}")
 
 def search_sessions(query):
     all_sessions = get_sessions()
@@ -589,6 +710,13 @@ def main():
     parser_search = subparsers.add_parser("search", help="Search session transcripts")
     parser_search.add_argument("query", help="Search term")
 
+    parser_jump = subparsers.add_parser("jump", help="Jump to a project directory")
+
+    parser_prune = subparsers.add_parser("prune", help="Prune old or short sessions")
+    parser_prune.add_argument("--days", type=int, default=30, help="Prune sessions older than this many days")
+    parser_prune.add_argument("--min-messages", type=int, default=0, help="Prune sessions with this many messages or fewer")
+    parser_prune.add_argument("--force", action="store_true", help="Actually perform the deletion")
+
     args = parser.parse_args()
 
     if args.command == "preview":
@@ -642,6 +770,21 @@ def main():
             update_session(selected)
             safe_key = shlex.quote(selected['key'])
             print(f"cd {safe_key} && kiro-cli chat --resume")
+        return
+
+    if args.command == "jump":
+        dirs = get_unique_directories()
+        if not dirs:
+            print("No directories found.", file=sys.stderr)
+            return
+        selected = select_directory(dirs)
+        if selected:
+            safe_key = shlex.quote(selected['key'])
+            print(f"cd {safe_key}")
+        return
+
+    if args.command == "prune":
+        prune_sessions(days=args.days, min_messages=args.min_messages, force=args.force)
         return
 
     # Interactive picker mode
