@@ -4,9 +4,11 @@ import json
 import os
 import sys
 import subprocess
-from datetime import datetime
+from datetime import datetime, timedelta
 import re
 import glob
+import argparse
+import shlex
 
 DB_PATH = os.environ.get("KIRO_DB_PATH") or os.path.expanduser("~/Library/Application Support/kiro-cli/data.sqlite3")
 SESSIONS_DIR = os.environ.get("KIRO_SESSIONS_DIR") or os.path.expanduser("~/.kiro/sessions/cli")
@@ -159,7 +161,9 @@ def get_sessions():
                 "id": conv_id,
                 "display": display,
                 "source": source,
-                "pid": pid
+                "pid": pid,
+                "updated_at": updated_at,
+                "msg_count": msg_count
             })
         except Exception:
             continue
@@ -373,9 +377,6 @@ def run_preview(path_ansi, conv_id_ansi, pid_ansi, project_ansi):
     except Exception as e:
         print(f"Error parsing preview: {e}")
 
-import argparse
-import shlex
-
 def dump_sessions(dest_dir, specific_session_id=None):
     if not os.path.exists(DB_PATH):
         print(f"Error: Database not found at {DB_PATH}", file=sys.stderr)
@@ -507,6 +508,110 @@ def show_stats():
     for m, count in sorted(models.items(), key=lambda x: x[1], reverse=True):
         print(f"  {m:20} {count} sessions")
 
+    # Top Files Discussed (from file_line_tracker)
+    files = {}
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    query = "SELECT value FROM conversations_v2 UNION ALL SELECT value FROM conversations"
+    cursor.execute(query)
+    for row in cursor.fetchall():
+        try:
+            data = json.loads(row[0])
+            tracker = data.get("file_line_tracker", {})
+            for filepath in tracker.keys():
+                # Basic normalization
+                norm_path = os.path.basename(filepath)
+                files[norm_path] = files.get(norm_path, 0) + 1
+        except: continue
+    conn.close()
+
+    if files:
+        print(f"\n{BOLD}Top Files Discussed:{RESET}")
+        for f, count in sorted(files.items(), key=lambda x: x[1], reverse=True)[:10]:
+            print(f"  {f:25} {count} times")
+
+def prune_sessions(days=None, min_messages=None, dry_run=True):
+    """Delete old sessions or sessions with few messages."""
+    sessions = get_sessions()
+    to_delete = []
+
+    now = datetime.now()
+
+    for s in sessions:
+        updated_at = s["updated_at"]
+        msg_count = s["msg_count"]
+
+        should_delete = False
+        reasons = []
+
+        if days is not None and updated_at > 0:
+            dt = datetime.fromtimestamp(updated_at / 1000)
+            if now - dt > timedelta(days=days):
+                should_delete = True
+                reasons.append(f"older than {days} days")
+
+        if min_messages is not None:
+            if msg_count < min_messages:
+                should_delete = True
+                reasons.append(f"fewer than {min_messages} messages")
+
+        if should_delete:
+            to_delete.append((s["id"], s["key"], ", ".join(reasons)))
+
+    if not to_delete:
+        print("No sessions matched pruning criteria.")
+        return
+
+    if dry_run:
+        print(f"{BOLD}{YELLOW}Dry run: The following sessions would be deleted:{RESET}")
+        for conv_id, key, reason in to_delete:
+            print(f"  {key} ({conv_id}) - {reason}")
+        print(f"\nTotal: {len(to_delete)} sessions.")
+    else:
+        print(f"{BOLD}{RED}Deleting {len(to_delete)} sessions...{RESET}")
+        delete_pairs = [(d[0], d[1]) for d in to_delete]
+        delete_sessions(delete_pairs)
+        print("Done.")
+
+def jump_to_project():
+    """Select a project directory from history and jump to it."""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+
+    # Get unique keys ordered by last update
+    query = """
+    SELECT key FROM conversations_v2
+    GROUP BY key
+    ORDER BY MAX(updated_at) DESC
+    """
+    cursor.execute(query)
+    paths = [row[0] for row in cursor.fetchall()]
+    conn.close()
+
+    if not paths:
+        print("No project history found.", file=sys.stderr)
+        return
+
+    fzf_input = "\n".join(paths)
+    fzf_cmd = ["fzf", "--height", "40%", "--reverse", "--header", "Select project to jump to"]
+
+    try:
+        process = subprocess.Popen(
+            fzf_cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=sys.stderr,
+            text=True
+        )
+        stdout, _ = process.communicate(input=fzf_input)
+
+        if process.returncode == 0 and stdout:
+            selected_path = stdout.strip()
+            print(f"cd {shlex.quote(selected_path)}")
+    except FileNotFoundError:
+        print("Error: 'fzf' is not installed.", file=sys.stderr)
+        sys.exit(1)
+
 def search_sessions(query):
     all_sessions = get_sessions()
     results = []
@@ -589,6 +694,13 @@ def main():
     parser_search = subparsers.add_parser("search", help="Search session transcripts")
     parser_search.add_argument("query", help="Search term")
 
+    parser_jump = subparsers.add_parser("jump", help="Jump to a project directory")
+
+    parser_prune = subparsers.add_parser("prune", help="Prune old or short sessions")
+    parser_prune.add_argument("--days", type=int, help="Delete sessions older than N days")
+    parser_prune.add_argument("--min-messages", type=int, help="Delete sessions with fewer than N messages")
+    parser_prune.add_argument("--force", action="store_true", help="Actually delete sessions (not a dry run)")
+
     args = parser.parse_args()
 
     if args.command == "preview":
@@ -642,6 +754,17 @@ def main():
             update_session(selected)
             safe_key = shlex.quote(selected['key'])
             print(f"cd {safe_key} && kiro-cli chat --resume")
+        return
+
+    if args.command == "jump":
+        jump_to_project()
+        return
+
+    if args.command == "prune":
+        if args.days is None and args.min_messages is None:
+            print("Error: Must specify --days or --min-messages", file=sys.stderr)
+            return
+        prune_sessions(days=args.days, min_messages=args.min_messages, dry_run=not args.force)
         return
 
     # Interactive picker mode
