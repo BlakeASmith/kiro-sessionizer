@@ -7,6 +7,8 @@ import subprocess
 from datetime import datetime
 import re
 import glob
+import argparse
+import shlex
 
 DB_PATH = os.environ.get("KIRO_DB_PATH") or os.path.expanduser("~/Library/Application Support/kiro-cli/data.sqlite3")
 SESSIONS_DIR = os.environ.get("KIRO_SESSIONS_DIR") or os.path.expanduser("~/.kiro/sessions/cli")
@@ -59,25 +61,33 @@ def get_active_sessions():
             except Exception:
                 continue
 
-    # Method 2: Fallback for non-interactive/hidden sessions (ps + lsof)
+    # Method 2: Fallback for non-interactive/hidden sessions (pgrep + lsof)
     try:
         # Get PIDs of all processes whose command line contains 'kiro-cli'
         ps_cmd = ["pgrep", "-f", "kiro-cli"]
         pids = subprocess.check_output(ps_cmd, text=True).strip().split('\n')
 
-        for pid_str in pids:
-            if not pid_str: continue
-            pid = int(pid_str)
-            if pid in active_paths.values(): continue # Already found via lock
+        # Filter out PIDs already found via lock
+        known_pids = set(active_paths.values())
+        pids_to_check = [p for p in pids if p and int(p) not in known_pids]
 
-            # Use lsof to find the CWD of the process
-            lsof_cmd = ["lsof", "-a", "-p", str(pid), "-d", "cwd", "-Fn"]
+        if pids_to_check:
+            # Batch lsof call for all PIDs
+            lsof_cmd = ["lsof", "-a", "-p", ",".join(pids_to_check), "-d", "cwd", "-Fn"]
             lsof_out = subprocess.check_output(lsof_cmd, text=True)
+
+            # Parse lsof output (batch mode)
+            # Format:
+            # p<pid>
+            # n<cwd>
+            current_pid = None
             for line in lsof_out.split('\n'):
-                if line.startswith('n'):
+                if line.startswith('p'):
+                    current_pid = int(line[1:])
+                elif line.startswith('n') and current_pid:
                     cwd = line[1:].strip()
                     if cwd and cwd not in active_paths:
-                        active_paths[cwd] = pid
+                        active_paths[cwd] = current_pid
     except Exception:
         pass # Fallback failed, ignore
 
@@ -182,6 +192,8 @@ def select_session(sessions):
     if is_fzf_tmux_supported():
         fzf_cmd.append("--tmux")
 
+    quoted_file = shlex.quote(__file__)
+
     fzf_cmd.extend([
         "--ansi",
         "--delimiter", "\t",
@@ -194,8 +206,8 @@ def select_session(sessions):
         "--marker", "✓",
         "--multi",
         "--color", "header:italic:underline,pointer:bold:blue,marker:bold:green",
-        "--preview", f"python3 {__file__} preview {{7}} {{9}} {{8}} {{2}}",
-        "--bind", f"ctrl-x:execute(python3 {__file__} delete-multi {{+9}} --keys {{+7}})+reload(python3 {__file__} list)",
+        "--preview", f"python3 {quoted_file} preview --path {{7}} --conv-id {{9}} --pid {{8}} --project {{2}}",
+        "--bind", f"ctrl-x:execute(python3 {quoted_file} delete-multi --ids {{+9}} --keys {{+7}})+reload(python3 {quoted_file} list)",
         "--info", "inline",
         "--footer", f"{DIM}ctrl-x: delete  tab: select multi{RESET}",
     ])
@@ -373,9 +385,6 @@ def run_preview(path_ansi, conv_id_ansi, pid_ansi, project_ansi):
     except Exception as e:
         print(f"Error parsing preview: {e}")
 
-import argparse
-import shlex
-
 def dump_sessions(dest_dir, specific_session_id=None):
     if not os.path.exists(DB_PATH):
         print(f"Error: Database not found at {DB_PATH}", file=sys.stderr)
@@ -460,6 +469,10 @@ def dump_sessions(dest_dir, specific_session_id=None):
     print(f"Successfully dumped {dumped_count} sessions.", file=sys.stderr)
 
 def show_stats():
+    if not os.path.exists(DB_PATH):
+        print(f"Error: Database not found at {DB_PATH}", file=sys.stderr)
+        return
+
     sessions = get_sessions()
     if not sessions:
         print("No sessions found.")
@@ -469,6 +482,7 @@ def show_stats():
     models = {}
     projects = {}
     total_msgs = 0
+    file_activity = {}
 
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
@@ -478,11 +492,22 @@ def show_stats():
     for row in cursor.fetchall():
         try:
             data = json.loads(row[0])
+
+            # Model usage
             model = data.get("model_info", {}).get("model_id", "unknown")
             models[model] = models.get(model, 0) + 1
 
-            key = "unknown"
-            # We don't have the key directly here easily without more complex query but we can infer from sessions
+            # History length
+            total_msgs += len(data.get("history", []))
+
+            # File activity trends (from file_line_tracker)
+            tracker = data.get("file_line_tracker", {})
+            if tracker:
+                # file_line_tracker is usually { "file_path": { ... } }
+                for fpath in tracker.keys():
+                    # Just get the filename or relative-ish path
+                    fname = os.path.basename(fpath)
+                    file_activity[fname] = file_activity.get(fname, 0) + 1
         except: continue
     conn.close()
 
@@ -490,22 +515,139 @@ def show_stats():
         project = os.path.basename(s["key"])
         projects[project] = projects.get(project, 0) + 1
 
-        # Extract message count from display (it's the 5th tab-separated field)
-        try:
-            parts = strip_ansi(s["display"]).split('\t')
-            total_msgs += int(parts[4])
-        except: pass
-
     print(f"{BOLD}{BLUE}--- Kiro Sessionizer Statistics ---{RESET}")
     print(f"{BOLD}Total Sessions:{RESET}  {total}")
     print(f"{BOLD}Total Messages:{RESET}  {total_msgs}")
+
     print(f"\n{BOLD}Top Projects:{RESET}")
     for p, count in sorted(projects.items(), key=lambda x: x[1], reverse=True)[:5]:
         print(f"  {p:20} {count} sessions")
 
+    print(f"\n{BOLD}Top Files Discussed:{RESET}")
+    for f, count in sorted(file_activity.items(), key=lambda x: x[1], reverse=True)[:10]:
+        print(f"  {f:25} {count} times")
+
     print(f"\n{BOLD}Model Usage:{RESET}")
     for m, count in sorted(models.items(), key=lambda x: x[1], reverse=True):
         print(f"  {m:20} {count} sessions")
+
+def prune_sessions(days, min_messages, dry_run=False):
+    if not os.path.exists(DB_PATH):
+        print(f"Error: Database not found at {DB_PATH}", file=sys.stderr)
+        return
+
+    sessions = get_sessions()
+    now = datetime.now()
+    to_delete = []
+
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+
+    query = """
+    SELECT key, conversation_id, value, updated_at
+    FROM conversations_v2
+    UNION ALL
+    SELECT key, 'legacy' as conversation_id, value, 0 as updated_at
+    FROM conversations
+    """
+    cursor.execute(query)
+    rows = cursor.fetchall()
+    conn.close()
+
+    for key, conv_id, value, updated_at in rows:
+        # Calculate age
+        try:
+            data = json.loads(value)
+            msg_count = len(data.get("history", []))
+
+            dt = datetime.fromtimestamp(updated_at / 1000) if updated_at > 0 else datetime.fromtimestamp(0)
+            age_days = (now - dt).days
+
+            if age_days >= days and msg_count <= min_messages:
+                to_delete.append((conv_id, key, age_days, msg_count))
+        except Exception:
+            continue
+
+    if not to_delete:
+        print("No sessions matched the pruning criteria.")
+        return
+
+    print(f"Found {len(to_delete)} sessions to prune:")
+    for conv_id, key, age, msgs in to_delete:
+        print(f"  - {key} ({conv_id}): {age} days old, {msgs} messages")
+
+    if dry_run:
+        print(f"\n{YELLOW}Dry run: {len(to_delete)} sessions would be deleted.{RESET}")
+    else:
+        confirm = input(f"\n{BOLD}{RED}Are you sure you want to delete these {len(to_delete)} sessions? (y/N): {RESET}")
+        if confirm.lower() == 'y':
+            pairs = [(d[0], d[1]) for d in to_delete]
+            delete_sessions(pairs)
+            print(f"Successfully pruned {len(to_delete)} sessions.")
+        else:
+            print("Pruning cancelled.")
+
+def jump_to_project():
+    if not os.path.exists(DB_PATH):
+        print(f"Error: Database not found at {DB_PATH}", file=sys.stderr)
+        return
+
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+
+    # Get unique project paths, ordered by last update
+    query = """
+    SELECT key, MAX(updated_at) as last_update
+    FROM (
+        SELECT key, updated_at FROM conversations_v2
+        UNION ALL
+        SELECT key, 0 as updated_at FROM conversations
+    )
+    GROUP BY key
+    ORDER BY last_update DESC;
+    """
+
+    cursor.execute(query)
+    rows = cursor.fetchall()
+    conn.close()
+
+    # Filter for paths that actually exist on disk
+    valid_paths = [row[0] for row in rows if os.path.exists(row[0])]
+
+    if not valid_paths:
+        print("No valid project paths found.", file=sys.stderr)
+        return
+
+    # Prepare for fzf
+    # Display format: project_name (full_path)
+    display_items = []
+    for path in valid_paths:
+        proj = os.path.basename(path)
+        display_items.append(f"{BOLD}{BLUE}{proj}{RESET}\t{DIM}{path}{RESET}")
+
+    fzf_input = "\n".join(display_items)
+
+    fzf_cmd = ["fzf", "--ansi", "--delimiter", "\t", "--with-nth", "1,2", "--reverse", "--header", "Select a project to jump to"]
+    if is_fzf_tmux_supported():
+        fzf_cmd.append("--tmux")
+
+    try:
+        process = subprocess.Popen(
+            fzf_cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=sys.stderr,
+            text=True
+        )
+        stdout, _ = process.communicate(input=fzf_input)
+
+        if process.returncode == 0 and stdout:
+            selected = stdout.strip()
+            # Extract path from the second column
+            selected_path = strip_ansi(selected).split('\t')[1].strip()
+            print(f"cd {shlex.quote(selected_path)}")
+    except FileNotFoundError:
+        print("Error: 'fzf' is not installed.", file=sys.stderr)
 
 def search_sessions(query):
     all_sessions = get_sessions()
@@ -566,15 +708,15 @@ def main():
 
     # Internal subcommands used by fzf
     parser_preview = subparsers.add_parser("preview", help=argparse.SUPPRESS)
-    parser_preview.add_argument("path")
-    parser_preview.add_argument("conv_id")
-    parser_preview.add_argument("pid")
-    parser_preview.add_argument("project", nargs="?", default="")
+    parser_preview.add_argument("--path", required=True)
+    parser_preview.add_argument("--conv-id", required=True)
+    parser_preview.add_argument("--pid", default="")
+    parser_preview.add_argument("--project", default="")
 
     parser_list = subparsers.add_parser("list", help=argparse.SUPPRESS)
 
     parser_delete = subparsers.add_parser("delete-multi", help=argparse.SUPPRESS)
-    parser_delete.add_argument("ids_str")
+    parser_delete.add_argument("--ids", required=True, dest="ids_str")
     parser_delete.add_argument("--keys", required=True, dest="keys_str")
 
     # User subcommands
@@ -588,6 +730,13 @@ def main():
 
     parser_search = subparsers.add_parser("search", help="Search session transcripts")
     parser_search.add_argument("query", help="Search term")
+
+    parser_jump = subparsers.add_parser("jump", help="Jump to a project directory")
+
+    parser_prune = subparsers.add_parser("prune", help="Prune old or empty sessions")
+    parser_prune.add_argument("--days", type=int, default=30, help="Minimum age in days (default: 30)")
+    parser_prune.add_argument("--min-messages", type=int, default=1, help="Maximum message count to prune (default: 1)")
+    parser_prune.add_argument("--dry-run", action="store_true", help="Show what would be deleted without actually deleting")
 
     args = parser.parse_args()
 
@@ -629,6 +778,14 @@ def main():
             print(f"cd {safe_key} && kiro-cli chat --resume")
         else:
             print("No sessions found.", file=sys.stderr)
+        return
+
+    if args.command == "jump":
+        jump_to_project()
+        return
+
+    if args.command == "prune":
+        prune_sessions(args.days, args.min_messages, args.dry_run)
         return
 
     if args.command == "search":
