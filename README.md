@@ -29,6 +29,34 @@ You can optionally dump a single specific session by passing its ID:
 kiro-sessionizer backup /path/to/destination/dir --session-id "my_session_id"
 ```
 
+### Navigation
+
+You can quickly jump to any project directory stored in your history using the `jump` subcommand. This opens `fzf` with a list of unique project paths, ordered by recency.
+
+```sh
+kiro-sessionizer jump
+```
+
+### Maintenance
+
+Keep your database clean by removing old or very short (likely accidental) sessions using the `prune` subcommand.
+
+```sh
+# Dry run: see what would be deleted
+kiro-sessionizer prune --dry-run
+
+# Actual prune (default: >30 days old OR <2 messages)
+kiro-sessionizer prune --days 60 --min-messages 3
+```
+
+### Statistics
+
+The `stats` command provides insights into your usage, including a list of the files you discuss most frequently with the AI.
+
+```sh
+kiro-sessionizer stats
+```
+
 ## Installation
 
 ```sh
