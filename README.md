@@ -29,6 +29,30 @@ You can optionally dump a single specific session by passing its ID:
 kiro-sessionizer backup /path/to/destination/dir --session-id "my_session_id"
 ```
 
+### Navigating Projects
+
+You can quickly jump to any project directory that has a session history using the `jump` subcommand. It will present an interactive list of unique project paths ordered by recency.
+
+```sh
+kiro-sessionizer jump
+```
+
+### Activity Journaling
+
+Generate a chronological journal of all AI-assisted activity for a specific project. This aggregates summaries and initial queries across all sessions in that directory.
+
+```sh
+kiro-sessionizer journal [/path/to/project]
+```
+
+### Database Maintenance
+
+Keep your session database lean by pruning old or abandoned sessions.
+
+```sh
+kiro-sessionizer prune --days 60 --min-messages 3
+```
+
 ## Installation
 
 ```sh
