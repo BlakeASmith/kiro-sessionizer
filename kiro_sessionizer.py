@@ -459,6 +459,71 @@ def dump_sessions(dest_dir, specific_session_id=None):
 
     print(f"Successfully dumped {dumped_count} sessions.", file=sys.stderr)
 
+def jump_to_project():
+    if not os.path.exists(DB_PATH):
+        print(f"Error: Database not found at {DB_PATH}", file=sys.stderr)
+        return
+
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+
+    # Get unique project paths, ordered by most recent activity
+    query = """
+    SELECT key FROM (
+        SELECT key, updated_at FROM conversations_v2
+        UNION ALL
+        SELECT key, 0 as updated_at FROM conversations
+    )
+    GROUP BY key
+    ORDER BY MAX(updated_at) DESC
+    """
+
+    cursor.execute(query)
+    rows = cursor.fetchall()
+    conn.close()
+
+    if not rows:
+        print("No projects found.", file=sys.stderr)
+        return
+
+    projects = [row[0] for row in rows if os.path.exists(row[0])]
+
+    if not projects:
+        print("No valid project directories found on disk.", file=sys.stderr)
+        return
+
+    fzf_input = "\n".join(projects)
+
+    fzf_cmd = ["fzf"]
+    if is_fzf_tmux_supported():
+        fzf_cmd.append("--tmux")
+
+    fzf_cmd.extend([
+        "--ansi",
+        "--header", f"{BOLD}{BLUE}Jump to Project{RESET}",
+        "--reverse",
+        "--height", "40%",
+        "--pointer", "▶",
+        "--info", "inline",
+    ])
+
+    try:
+        process = subprocess.Popen(
+            fzf_cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=sys.stderr,
+            text=True
+        )
+        stdout, _ = process.communicate(input=fzf_input)
+
+        if process.returncode == 0 and stdout:
+            selected_path = stdout.strip()
+            print(f"cd {shlex.quote(selected_path)}")
+    except FileNotFoundError:
+        print("Error: 'fzf' is not installed.", file=sys.stderr)
+        sys.exit(1)
+
 def show_stats():
     sessions = get_sessions()
     if not sessions:
@@ -468,6 +533,7 @@ def show_stats():
     total = len(sessions)
     models = {}
     projects = {}
+    files_discussed = {}
     total_msgs = 0
 
     conn = sqlite3.connect(DB_PATH)
@@ -478,11 +544,16 @@ def show_stats():
     for row in cursor.fetchall():
         try:
             data = json.loads(row[0])
+            # Model usage
             model = data.get("model_info", {}).get("model_id", "unknown")
             models[model] = models.get(model, 0) + 1
 
-            key = "unknown"
-            # We don't have the key directly here easily without more complex query but we can infer from sessions
+            # Files discussed
+            tracker = data.get("file_line_tracker", {})
+            for file_path in tracker.keys():
+                file_name = os.path.basename(file_path)
+                files_discussed[file_name] = files_discussed.get(file_name, 0) + 1
+
         except: continue
     conn.close()
 
@@ -506,6 +577,11 @@ def show_stats():
     print(f"\n{BOLD}Model Usage:{RESET}")
     for m, count in sorted(models.items(), key=lambda x: x[1], reverse=True):
         print(f"  {m:20} {count} sessions")
+
+    if files_discussed:
+        print(f"\n{BOLD}Top Files Discussed:{RESET}")
+        for f, count in sorted(files_discussed.items(), key=lambda x: x[1], reverse=True)[:10]:
+            print(f"  {f:20} {count} sessions")
 
 def search_sessions(query):
     all_sessions = get_sessions()
@@ -589,6 +665,8 @@ def main():
     parser_search = subparsers.add_parser("search", help="Search session transcripts")
     parser_search.add_argument("query", help="Search term")
 
+    parser_jump = subparsers.add_parser("jump", help="Jump to a project directory")
+
     args = parser.parse_args()
 
     if args.command == "preview":
@@ -618,6 +696,10 @@ def main():
 
     if args.command == "stats":
         show_stats()
+        return
+
+    if args.command == "jump":
+        jump_to_project()
         return
 
     if args.command == "continue":
