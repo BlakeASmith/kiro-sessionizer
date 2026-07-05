@@ -283,6 +283,171 @@ def update_session(session):
     conn.commit()
     conn.close()
 
+def jump_to_project():
+    """Interactive directory picker to jump to past project directories."""
+    if not os.path.exists(DB_PATH):
+        print(f"Error: Database not found at {DB_PATH}", file=sys.stderr)
+        return
+
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+
+    # Get unique project paths, ordered by most recent session
+    query = """
+    SELECT key FROM (
+        SELECT key, updated_at FROM conversations_v2
+        UNION ALL
+        SELECT key, 0 as updated_at FROM conversations
+    )
+    GROUP BY key
+    ORDER BY MAX(updated_at) DESC
+    """
+    cursor.execute(query)
+    paths = [row[0] for row in cursor.fetchall() if os.path.exists(row[0])]
+    conn.close()
+
+    if not paths:
+        print("No project paths found.", file=sys.stderr)
+        return
+
+    fzf_input = "\n".join(paths)
+    fzf_cmd = ["fzf", "--reverse", "--height", "40%", "--header", "Jump to Project"]
+    if is_fzf_tmux_supported():
+        fzf_cmd.append("--tmux")
+
+    try:
+        process = subprocess.Popen(
+            fzf_cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=sys.stderr,
+            text=True
+        )
+        stdout, _ = process.communicate(input=fzf_input)
+
+        if process.returncode == 0 and stdout:
+            selected_path = stdout.strip()
+            print(f"cd {shlex.quote(selected_path)}")
+    except FileNotFoundError:
+        print("Error: 'fzf' is not installed.", file=sys.stderr)
+
+def prune_sessions(days, min_messages, dry_run=False, force=False):
+    """Delete old or short sessions."""
+    if not os.path.exists(DB_PATH):
+        print(f"Error: Database not found at {DB_PATH}", file=sys.stderr)
+        return
+
+    cutoff_ms = int((datetime.now() - timedelta(days=days)).timestamp() * 1000)
+
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+
+    query = """
+    SELECT key, conversation_id, value, updated_at FROM conversations_v2
+    UNION ALL
+    SELECT key, 'legacy' as conversation_id, value, 0 as updated_at FROM conversations
+    """
+    cursor.execute(query)
+    rows = cursor.fetchall()
+
+    to_delete = []
+    for key, conv_id, value, updated_at in rows:
+        try:
+            data = json.loads(value)
+            history = data.get("history", [])
+            msg_count = len(history)
+
+            is_old = updated_at < cutoff_ms
+            is_short = msg_count < min_messages
+
+            if is_old or is_short:
+                reason = []
+                if is_old: reason.append(f"older than {days} days")
+                if is_short: reason.append(f"fewer than {min_messages} messages")
+                to_delete.append((conv_id, key, ", ".join(reason)))
+        except:
+            continue
+
+    if not to_delete:
+        print("No sessions matched the pruning criteria.")
+        conn.close()
+        return
+
+    print(f"{BOLD}{YELLOW}Found {len(to_delete)} sessions to prune:{RESET}")
+    for conv_id, key, reason in to_delete:
+        print(f"  - {key} ({conv_id}): {reason}")
+
+    if dry_run:
+        print(f"\n{CYAN}Dry run: no sessions were deleted.{RESET}")
+        conn.close()
+        return
+
+    if not force:
+        confirm = input(f"\n{BOLD}{RED}Are you sure you want to delete these {len(to_delete)} sessions? [y/N]{RESET} ")
+        if confirm.lower() != 'y':
+            print("Aborted.")
+            conn.close()
+            return
+
+    delete_sessions([(cid, k) for cid, k, r in to_delete])
+    print(f"\n{GREEN}Successfully pruned {len(to_delete)} sessions.{RESET}")
+    conn.close()
+
+def show_journal(project_path=None):
+    """Show a chronological summary of sessions for a project."""
+    if not os.path.exists(DB_PATH):
+        print(f"Error: Database not found at {DB_PATH}", file=sys.stderr)
+        return
+
+    target_path = os.path.abspath(project_path or os.getcwd())
+
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+
+    query = """
+    SELECT updated_at, value FROM conversations_v2 WHERE key = ?
+    UNION ALL
+    SELECT 0 as updated_at, value FROM conversations WHERE key = ?
+    ORDER BY updated_at ASC
+    """
+    cursor.execute(query, (target_path, target_path))
+    rows = cursor.fetchall()
+    conn.close()
+
+    if not rows:
+        print(f"No sessions found for project: {target_path}")
+        return
+
+    print(f"{BOLD}{BLUE}--- Project Journal: {os.path.basename(target_path)} ---{RESET}")
+    print(f"{DIM}Path: {target_path}{RESET}\n")
+
+    for updated_at, value in rows:
+        try:
+            data = json.loads(value)
+            dt = datetime.fromtimestamp(updated_at / 1000) if updated_at > 0 else None
+            date_str = dt.strftime("%Y-%m-%d %H:%M") if dt else "Legacy/Unknown"
+
+            summary = data.get("latest_summary")
+            transcript = data.get("transcript", [])
+
+            # Find first user query if no summary
+            first_query = ""
+            for line in transcript:
+                if line.startswith("> "):
+                    first_query = line[2:].strip()
+                    break
+
+            print(f"{YELLOW}[{date_str}]{RESET}")
+            if summary:
+                print(f"  {BOLD}Summary:{RESET} {summary}")
+            elif first_query:
+                print(f"  {BOLD}Started with:{RESET} {first_query}...")
+            else:
+                print(f"  {ITALIC}(No summary available){RESET}")
+            print()
+        except:
+            continue
+
 def run_preview(path_ansi, conv_id_ansi, pid_ansi, project_ansi):
     path = strip_ansi(path_ansi).strip()
     conv_id = strip_ansi(conv_id_ansi).strip()
@@ -375,6 +540,7 @@ def run_preview(path_ansi, conv_id_ansi, pid_ansi, project_ansi):
 
 import argparse
 import shlex
+from datetime import timedelta
 
 def dump_sessions(dest_dir, specific_session_id=None):
     if not os.path.exists(DB_PATH):
@@ -468,6 +634,7 @@ def show_stats():
     total = len(sessions)
     models = {}
     projects = {}
+    files = {}
     total_msgs = 0
 
     conn = sqlite3.connect(DB_PATH)
@@ -478,11 +645,16 @@ def show_stats():
     for row in cursor.fetchall():
         try:
             data = json.loads(row[0])
-            model = data.get("model_info", {}).get("model_id", "unknown")
+            model_info = data.get("model_info", {})
+            model = model_info.get("model_id", "unknown") if isinstance(model_info, dict) else "unknown"
             models[model] = models.get(model, 0) + 1
 
-            key = "unknown"
-            # We don't have the key directly here easily without more complex query but we can infer from sessions
+            # Extract file activity
+            tracker = data.get("file_line_tracker", {})
+            if isinstance(tracker, dict):
+                for filepath in tracker.keys():
+                    filename = os.path.basename(filepath)
+                    files[filename] = files.get(filename, 0) + 1
         except: continue
     conn.close()
 
@@ -506,6 +678,10 @@ def show_stats():
     print(f"\n{BOLD}Model Usage:{RESET}")
     for m, count in sorted(models.items(), key=lambda x: x[1], reverse=True):
         print(f"  {m:20} {count} sessions")
+
+    print(f"\n{BOLD}Top Files Discussed:{RESET}")
+    for f, count in sorted(files.items(), key=lambda x: x[1], reverse=True)[:10]:
+        print(f"  {f:20} {count} sessions")
 
 def search_sessions(query):
     all_sessions = get_sessions()
@@ -589,6 +765,17 @@ def main():
     parser_search = subparsers.add_parser("search", help="Search session transcripts")
     parser_search.add_argument("query", help="Search term")
 
+    parser_jump = subparsers.add_parser("jump", help="Jump to a project directory")
+
+    parser_prune = subparsers.add_parser("prune", help="Delete old or short sessions")
+    parser_prune.add_argument("--days", type=int, default=30, help="Delete sessions older than this (default: 30)")
+    parser_prune.add_argument("--min-messages", type=int, default=3, help="Delete sessions with fewer messages than this (default: 3)")
+    parser_prune.add_argument("--dry-run", action="store_true", help="Show what would be deleted without actually deleting")
+    parser_prune.add_argument("--force", action="store_true", help="Don't ask for confirmation")
+
+    parser_journal = subparsers.add_parser("journal", help="Show chronological project summary")
+    parser_journal.add_argument("path", nargs="?", help="Project path (default: current directory)")
+
     args = parser.parse_args()
 
     if args.command == "preview":
@@ -642,6 +829,18 @@ def main():
             update_session(selected)
             safe_key = shlex.quote(selected['key'])
             print(f"cd {safe_key} && kiro-cli chat --resume")
+        return
+
+    if args.command == "jump":
+        jump_to_project()
+        return
+
+    if args.command == "prune":
+        prune_sessions(args.days, args.min_messages, args.dry_run, args.force)
+        return
+
+    if args.command == "journal":
+        show_journal(args.path)
         return
 
     # Interactive picker mode
