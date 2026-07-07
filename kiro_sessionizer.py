@@ -7,6 +7,8 @@ import subprocess
 from datetime import datetime
 import re
 import glob
+import argparse
+import shlex
 
 DB_PATH = os.environ.get("KIRO_DB_PATH") or os.path.expanduser("~/Library/Application Support/kiro-cli/data.sqlite3")
 SESSIONS_DIR = os.environ.get("KIRO_SESSIONS_DIR") or os.path.expanduser("~/.kiro/sessions/cli")
@@ -94,18 +96,25 @@ def get_sessions():
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     
-    query = """
-    SELECT key, conversation_id, value, updated_at, 'v2' as source
-    FROM conversations_v2
-    UNION ALL
-    SELECT key, 'legacy' as conversation_id, value, 0 as updated_at, 'v1' as source
-    FROM conversations
-    ORDER BY updated_at DESC;
-    """
-    
-    cursor.execute(query)
-    rows = cursor.fetchall()
+    rows = []
+    # Try v2
+    try:
+        cursor.execute("SELECT key, conversation_id, value, updated_at, 'v2' FROM conversations_v2")
+        rows.extend(cursor.fetchall())
+    except sqlite3.OperationalError:
+        pass
+
+    # Try v1
+    try:
+        cursor.execute("SELECT key, 'legacy', value, 0, 'v1' FROM conversations")
+        rows.extend(cursor.fetchall())
+    except sqlite3.OperationalError:
+        pass
+
     conn.close()
+
+    # Sort by updated_at DESC
+    rows.sort(key=lambda x: x[3], reverse=True)
     
     sessions = []
     for row in rows:
@@ -176,6 +185,8 @@ def is_fzf_tmux_supported():
         return False
 
 def select_session(sessions):
+    if not sessions:
+        return None
     fzf_input = "\n".join([s["display"] for s in sessions])
     
     fzf_cmd = ["fzf"]
@@ -373,9 +384,6 @@ def run_preview(path_ansi, conv_id_ansi, pid_ansi, project_ansi):
     except Exception as e:
         print(f"Error parsing preview: {e}")
 
-import argparse
-import shlex
-
 def dump_sessions(dest_dir, specific_session_id=None):
     if not os.path.exists(DB_PATH):
         print(f"Error: Database not found at {DB_PATH}", file=sys.stderr)
@@ -459,6 +467,67 @@ def dump_sessions(dest_dir, specific_session_id=None):
 
     print(f"Successfully dumped {dumped_count} sessions.", file=sys.stderr)
 
+def jump_to_project():
+    if not os.path.exists(DB_PATH):
+        print(f"Error: Database not found at {DB_PATH}", file=sys.stderr)
+        return
+
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+
+    # Get unique project paths, ordered by recency
+    rows = []
+    try:
+        cursor.execute("SELECT key, MAX(updated_at) FROM conversations_v2 GROUP BY key")
+        rows.extend(cursor.fetchall())
+    except sqlite3.OperationalError:
+        pass
+    try:
+        cursor.execute("SELECT key, 0 FROM conversations GROUP BY key")
+        rows.extend(cursor.fetchall())
+    except sqlite3.OperationalError:
+        pass
+    conn.close()
+
+    if not rows:
+        print("No project paths found in database.", file=sys.stderr)
+        return
+
+    # Aggregate by key and find max updated_at
+    path_map = {}
+    for key, ts in rows:
+        ts_val = ts if ts is not None else 0
+        path_map[key] = max(path_map.get(key, 0), ts_val)
+
+    # Sort by recency and filter for existence
+    sorted_paths = sorted(path_map.items(), key=lambda x: x[1], reverse=True)
+    paths = [p for p, ts in sorted_paths if os.path.exists(p)]
+
+    if not paths:
+        print("No project paths found in database.", file=sys.stderr)
+        return
+
+    fzf_input = "\n".join(paths)
+    fzf_cmd = ["fzf", "--ansi", "--reverse", "--height", "40%", "--prompt", "Jump to project > "]
+    if is_fzf_tmux_supported():
+        fzf_cmd.append("--tmux")
+
+    try:
+        process = subprocess.Popen(
+            fzf_cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=sys.stderr,
+            text=True
+        )
+        stdout, _ = process.communicate(input=fzf_input)
+
+        if process.returncode == 0 and stdout:
+            selected_path = stdout.strip()
+            print(f"cd {shlex.quote(selected_path)}")
+    except FileNotFoundError:
+        print("Error: 'fzf' is not installed.", file=sys.stderr)
+
 def show_stats():
     sessions = get_sessions()
     if not sessions:
@@ -468,23 +537,37 @@ def show_stats():
     total = len(sessions)
     models = {}
     projects = {}
+    files_discussed = {}
     total_msgs = 0
 
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
 
-    query = "SELECT value FROM conversations_v2 UNION ALL SELECT value FROM conversations"
-    cursor.execute(query)
-    for row in cursor.fetchall():
+    rows = []
+    try:
+        cursor.execute("SELECT value FROM conversations_v2")
+        rows.extend(cursor.fetchall())
+    except sqlite3.OperationalError:
+        pass
+    try:
+        cursor.execute("SELECT value FROM conversations")
+        rows.extend(cursor.fetchall())
+    except sqlite3.OperationalError:
+        pass
+    conn.close()
+
+    for row in rows:
         try:
             data = json.loads(row[0])
             model = data.get("model_info", {}).get("model_id", "unknown")
             models[model] = models.get(model, 0) + 1
 
-            key = "unknown"
-            # We don't have the key directly here easily without more complex query but we can infer from sessions
+            tracker = data.get("file_line_tracker", {})
+            if tracker:
+                for file_path in tracker.keys():
+                    file_name = os.path.basename(file_path)
+                    files_discussed[file_name] = files_discussed.get(file_name, 0) + 1
         except: continue
-    conn.close()
 
     for s in sessions:
         project = os.path.basename(s["key"])
@@ -502,6 +585,10 @@ def show_stats():
     print(f"\n{BOLD}Top Projects:{RESET}")
     for p, count in sorted(projects.items(), key=lambda x: x[1], reverse=True)[:5]:
         print(f"  {p:20} {count} sessions")
+
+    print(f"\n{BOLD}Top Files Discussed:{RESET}")
+    for f, count in sorted(files_discussed.items(), key=lambda x: x[1], reverse=True)[:10]:
+        print(f"  {f:20} {count} times")
 
     print(f"\n{BOLD}Model Usage:{RESET}")
     for m, count in sorted(models.items(), key=lambda x: x[1], reverse=True):
@@ -589,6 +676,8 @@ def main():
     parser_search = subparsers.add_parser("search", help="Search session transcripts")
     parser_search.add_argument("query", help="Search term")
 
+    parser_jump = subparsers.add_parser("jump", help="Jump to a project directory")
+
     args = parser.parse_args()
 
     if args.command == "preview":
@@ -618,6 +707,10 @@ def main():
 
     if args.command == "stats":
         show_stats()
+        return
+
+    if args.command == "jump":
+        jump_to_project()
         return
 
     if args.command == "continue":
