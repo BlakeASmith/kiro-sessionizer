@@ -560,6 +560,159 @@ def search_sessions(query):
     conn.close()
     return results
 
+def generate_report(days, project=None):
+    if not os.path.exists(DB_PATH):
+        print(f"Error: Database not found at {DB_PATH}", file=sys.stderr)
+        return
+
+    now_ms = int(datetime.now().timestamp() * 1000)
+    cutoff_ms = now_ms - (days * 24 * 60 * 60 * 1000)
+
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+
+    try:
+        query = """
+        SELECT key, conversation_id, value, updated_at, 'v2' as source
+        FROM conversations_v2
+        UNION ALL
+        SELECT key, 'legacy' as conversation_id, value, 0 as updated_at, 'v1' as source
+        FROM conversations
+        ORDER BY updated_at DESC;
+        """
+        cursor.execute(query)
+        rows = cursor.fetchall()
+    except Exception as e:
+        print(f"Error querying database: {e}", file=sys.stderr)
+        conn.close()
+        return
+    finally:
+        conn.close()
+
+    # Group sessions by project path
+    project_sessions = {}
+
+    for row in rows:
+        key, conv_id, value, updated_at, source = row
+
+        # Filter by timeframe
+        # If legacy, we exclude it from recent reports (updated_at = 0) unless days is very large or <= 0 (all history)
+        if days > 0 and updated_at < cutoff_ms:
+            continue
+
+        # Filter by project
+        if project:
+            project_lower = project.lower()
+            key_lower = key.lower()
+            proj_base = os.path.basename(key.rstrip(os.sep)).lower()
+            if project_lower not in key_lower and project_lower not in proj_base:
+                continue
+
+        try:
+            data = json.loads(value)
+            model_info = data.get("model_info", {})
+            model = model_info.get("model_id", "auto") if isinstance(model_info, dict) else "auto"
+            history = data.get("history", [])
+            msg_count = len(history)
+            summary = data.get("latest_summary")
+            transcript = data.get("transcript", [])
+
+            # Extract first query
+            first_query = ""
+            for line in transcript:
+                line_str = line.strip()
+                if line_str.startswith("> "):
+                    first_query = line_str[2:].strip()
+                    break
+
+            # Extract files from file_line_tracker
+            tracker = data.get("file_line_tracker")
+            files_touched = []
+            if isinstance(tracker, dict):
+                for filepath in tracker.keys():
+                    if filepath:
+                        files_touched.append(filepath)
+            elif isinstance(tracker, list):
+                for filepath in tracker:
+                    if isinstance(filepath, str):
+                        files_touched.append(filepath)
+
+            # Clean and relative-ize paths
+            clean_files = []
+            for f in files_touched:
+                if os.path.isabs(f):
+                    if f.startswith(key):
+                        rel = os.path.relpath(f, key)
+                        clean_files.append(rel)
+                    else:
+                        clean_files.append(f)
+                else:
+                    clean_files.append(f)
+
+            # Format update date/time
+            dt = datetime.fromtimestamp(updated_at / 1000) if updated_at > 0 else datetime.now()
+            date_str = dt.strftime("%Y-%m-%d %H:%M")
+
+            session_info = {
+                "id": conv_id,
+                "date": date_str,
+                "model": model,
+                "msg_count": msg_count,
+                "first_query": first_query,
+                "summary": summary,
+                "files": sorted(list(set(clean_files))),
+                "source": source
+            }
+
+            if key not in project_sessions:
+                project_sessions[key] = []
+            project_sessions[key].append(session_info)
+
+        except Exception as e:
+            continue
+
+    if not project_sessions:
+        print(f"No active sessions found for the last {days} days matching the filter.")
+        return
+
+    # Output report in beautiful Markdown
+    print(f"# Kiro CLI Activity Report")
+    print(f"**Timeframe:** Last {days} day(s) (since {datetime.fromtimestamp(cutoff_ms / 1000).strftime('%Y-%m-%d %H:%M')})")
+    if project:
+        print(f"**Filter:** `{project}`")
+    print()
+
+    for key, sessions in sorted(project_sessions.items()):
+        project_name = os.path.basename(key.rstrip(os.sep))
+        print(f"## Project: {project_name}")
+        print(f"*Path: `{key}`*")
+        print()
+
+        for idx, s in enumerate(sessions, 1):
+            title = s["first_query"][:60] + "..." if s["first_query"] else f"Session {s['id'][:8]}"
+            print(f"### {idx}. {title}")
+            print(f"- **Date/Time:** {s['date']}")
+            print(f"- **Model:** `{s['model']}`")
+            print(f"- **Message Count:** {s['msg_count']}")
+
+            if s["first_query"]:
+                print(f"- **Initial Prompt:**")
+                print(f"  > {s['first_query']}")
+
+            if s["summary"]:
+                print(f"- **Summary of Work:**")
+                print(f"  *{s['summary'].strip()}*")
+            else:
+                print(f"- **Summary of Work:** *No summary recorded.*")
+
+            if s["files"]:
+                print(f"- **Files Touched/Discussed:**")
+                for f in s["files"]:
+                    print(f"  - `{f}`")
+            else:
+                print(f"- **Files Touched/Discussed:** *None recorded.*")
+            print()
+
 def main():
     parser = argparse.ArgumentParser(description="Global session resume support for kiro-cli")
     subparsers = parser.add_subparsers(dest="command")
@@ -588,6 +741,10 @@ def main():
 
     parser_search = subparsers.add_parser("search", help="Search session transcripts")
     parser_search.add_argument("query", help="Search term")
+
+    parser_report = subparsers.add_parser("report", help="Generate a Daily Standup / Work Session report")
+    parser_report.add_argument("--days", type=int, default=1, help="Number of days to include in the report (default: 1)")
+    parser_report.add_argument("--project", help="Optional project name/directory to filter by")
 
     args = parser.parse_args()
 
@@ -618,6 +775,10 @@ def main():
 
     if args.command == "stats":
         show_stats()
+        return
+
+    if args.command == "report":
+        generate_report(args.days, args.project)
         return
 
     if args.command == "continue":
