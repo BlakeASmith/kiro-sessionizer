@@ -7,6 +7,8 @@ import subprocess
 from datetime import datetime
 import re
 import glob
+import argparse
+import shlex
 
 DB_PATH = os.environ.get("KIRO_DB_PATH") or os.path.expanduser("~/Library/Application Support/kiro-cli/data.sqlite3")
 SESSIONS_DIR = os.environ.get("KIRO_SESSIONS_DIR") or os.path.expanduser("~/.kiro/sessions/cli")
@@ -182,6 +184,8 @@ def select_session(sessions):
     if is_fzf_tmux_supported():
         fzf_cmd.append("--tmux")
 
+    file_path_quoted = shlex.quote(__file__)
+
     fzf_cmd.extend([
         "--ansi",
         "--delimiter", "\t",
@@ -194,10 +198,10 @@ def select_session(sessions):
         "--marker", "✓",
         "--multi",
         "--color", "header:italic:underline,pointer:bold:blue,marker:bold:green",
-        "--preview", f"python3 {__file__} preview {{7}} {{9}} {{8}} {{2}}",
-        "--bind", f"ctrl-x:execute(python3 {__file__} delete-multi {{+9}} --keys {{+7}})+reload(python3 {__file__} list)",
+        "--preview", f"python3 {file_path_quoted} preview {{7}} {{9}} {{8}} {{2}}",
+        "--bind", f"ctrl-x:execute(python3 {file_path_quoted} delete-multi {{+9}} --keys {{+7}})+reload(python3 {file_path_quoted} list),ctrl-o:execute(python3 {file_path_quoted} restore {{9}} --keys {{7}})",
         "--info", "inline",
-        "--footer", f"{DIM}ctrl-x: delete  tab: select multi{RESET}",
+        "--footer", f"{DIM}ctrl-x: delete  ctrl-o: open files  tab: select multi{RESET}",
     ])
 
     try:
@@ -373,9 +377,6 @@ def run_preview(path_ansi, conv_id_ansi, pid_ansi, project_ansi):
     except Exception as e:
         print(f"Error parsing preview: {e}")
 
-import argparse
-import shlex
-
 def dump_sessions(dest_dir, specific_session_id=None):
     if not os.path.exists(DB_PATH):
         print(f"Error: Database not found at {DB_PATH}", file=sys.stderr)
@@ -468,44 +469,63 @@ def show_stats():
     total = len(sessions)
     models = {}
     projects = {}
+    file_counts = {}
     total_msgs = 0
 
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
 
     query = "SELECT value FROM conversations_v2 UNION ALL SELECT value FROM conversations"
-    cursor.execute(query)
-    for row in cursor.fetchall():
+    try:
+        cursor.execute(query)
+        rows = cursor.fetchall()
+    except sqlite3.OperationalError:
+        rows = []
+
+    for row in rows:
         try:
             data = json.loads(row[0])
-            model = data.get("model_info", {}).get("model_id", "unknown")
+            model_info = data.get("model_info")
+            if isinstance(model_info, dict):
+                model = model_info.get("model_id", "unknown")
+            else:
+                model = "unknown"
             models[model] = models.get(model, 0) + 1
 
-            key = "unknown"
-            # We don't have the key directly here easily without more complex query but we can infer from sessions
-        except: continue
+            tracker = data.get("file_line_tracker") or {}
+            for path in tracker.keys():
+                filename = os.path.basename(path)
+                if filename:
+                    file_counts[filename] = file_counts.get(filename, 0) + 1
+        except Exception:
+            continue
     conn.close()
 
     for s in sessions:
         project = os.path.basename(s["key"])
         projects[project] = projects.get(project, 0) + 1
 
-        # Extract message count from display (it's the 5th tab-separated field)
         try:
             parts = strip_ansi(s["display"]).split('\t')
             total_msgs += int(parts[4])
-        except: pass
+        except Exception:
+            pass
 
     print(f"{BOLD}{BLUE}--- Kiro Sessionizer Statistics ---{RESET}")
     print(f"{BOLD}Total Sessions:{RESET}  {total}")
     print(f"{BOLD}Total Messages:{RESET}  {total_msgs}")
+
     print(f"\n{BOLD}Top Projects:{RESET}")
-    for p, count in sorted(projects.items(), key=lambda x: x[1], reverse=True)[:5]:
+    for p, count in sorted(projects.items(), key=lambda x: x[1], reverse=True)[:10]:
         print(f"  {p:20} {count} sessions")
 
     print(f"\n{BOLD}Model Usage:{RESET}")
     for m, count in sorted(models.items(), key=lambda x: x[1], reverse=True):
         print(f"  {m:20} {count} sessions")
+
+    print(f"\n{BOLD}Top Files Discussed:{RESET}")
+    for f, count in sorted(file_counts.items(), key=lambda x: x[1], reverse=True)[:10]:
+        print(f"  {f:30} {count} times")
 
 def search_sessions(query):
     all_sessions = get_sessions()
@@ -560,6 +580,525 @@ def search_sessions(query):
     conn.close()
     return results
 
+def restore_files(session_id, key=None, editor=None):
+    if not os.path.exists(DB_PATH):
+        print(f"Error: Database not found at {DB_PATH}", file=sys.stderr)
+        sys.exit(1)
+
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+
+    value = None
+    try:
+        if session_id == "legacy":
+            if key:
+                cursor.execute("SELECT value FROM conversations WHERE key = ?", (key,))
+                row = cursor.fetchone()
+                if row:
+                    value = row[0]
+        else:
+            if key:
+                cursor.execute(
+                    "SELECT value FROM conversations_v2 WHERE conversation_id = ? AND key = ?",
+                    (session_id, key)
+                )
+                row = cursor.fetchone()
+                if row:
+                    value = row[0]
+            if not value:
+                cursor.execute(
+                    "SELECT value FROM conversations_v2 WHERE conversation_id = ?",
+                    (session_id,)
+                )
+                row = cursor.fetchone()
+                if row:
+                    value = row[0]
+    except sqlite3.OperationalError as e:
+        print(f"Error reading database: {e}", file=sys.stderr)
+        conn.close()
+        sys.exit(1)
+
+    conn.close()
+
+    if not value:
+        print(f"Error: Session {session_id} not found.", file=sys.stderr)
+        return
+
+    try:
+        data = json.loads(value)
+        tracker = data.get("file_line_tracker") or {}
+        files = list(tracker.keys())
+    except Exception as e:
+        print(f"Error parsing session data: {e}", file=sys.stderr)
+        return
+
+    existing_files = []
+    for f in files:
+        abs_f = os.path.abspath(f) if not os.path.isabs(f) else f
+        if os.path.exists(abs_f) and os.path.isfile(abs_f):
+            existing_files.append(abs_f)
+
+    if not existing_files:
+        print("No files to restore or files do not exist.", file=sys.stderr)
+        return
+
+    detected_editor = editor or os.environ.get("EDITOR")
+    if not detected_editor:
+        for candidate in ["code", "cursor", "vim", "nano"]:
+            try:
+                res = subprocess.run(["which", candidate], capture_output=True, text=True)
+                if res.returncode == 0:
+                    detected_editor = candidate
+                    break
+            except Exception:
+                continue
+
+    if detected_editor:
+        print(f"Opening {len(existing_files)} file(s) in {detected_editor}...", file=sys.stderr)
+        try:
+            if detected_editor in ["vim", "nano"]:
+                subprocess.run([detected_editor] + existing_files)
+            else:
+                subprocess.run([detected_editor] + existing_files, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception as e:
+            print(f"Error launching editor: {e}", file=sys.stderr)
+    else:
+        print("No editor detected/specified. Launching nested picker...", file=sys.stderr)
+        fzf_input = "\n".join(existing_files)
+        fzf_cmd = ["fzf", "--reverse", "--header", "Select a file to open"]
+        if is_fzf_tmux_supported():
+            fzf_cmd.append("--tmux")
+        try:
+            process = subprocess.Popen(
+                fzf_cmd,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=sys.stderr,
+                text=True
+            )
+            stdout, _ = process.communicate(input=fzf_input)
+            if process.returncode == 0 and stdout:
+                selected_file = stdout.strip()
+                if sys.platform == "darwin":
+                    subprocess.run(["open", selected_file])
+                elif sys.platform.startswith("linux"):
+                    subprocess.run(["xdg-open", selected_file])
+                else:
+                    print(f"Selected file: {selected_file}")
+        except Exception as e:
+            print(f"Error in nested fzf: {e}", file=sys.stderr)
+
+def commit_draft():
+    if not os.path.exists(DB_PATH):
+        print(f"Error: Database not found at {DB_PATH}", file=sys.stderr)
+        sys.exit(1)
+
+    sessions = get_sessions()
+    if not sessions:
+        print("No sessions found to draft commit from.", file=sys.stderr)
+        return
+
+    recent = sessions[0]
+
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+
+    if recent["id"] == "legacy":
+        cursor.execute("SELECT value FROM conversations WHERE key = ?", (recent["key"],))
+    else:
+        cursor.execute(
+            "SELECT value FROM conversations_v2 WHERE conversation_id = ? AND key = ?",
+            (recent["id"], recent["key"])
+        )
+    row = cursor.fetchone()
+    conn.close()
+
+    if not row:
+        print("Error: Could not retrieve data for the most recent session.", file=sys.stderr)
+        return
+
+    try:
+        data = json.loads(row[0])
+        summary = data.get("latest_summary") or "Work session details"
+        tracker = data.get("file_line_tracker") or {}
+        files = list(tracker.keys())
+    except Exception as e:
+        print(f"Error parsing session data: {e}", file=sys.stderr)
+        return
+
+    project_name = os.path.basename(recent["key"])
+
+    summary_sentence = summary.split(".")[0].strip()
+    if len(summary_sentence) > 50:
+        summary_sentence = summary_sentence[:47] + "..."
+
+    subject = f"dev({project_name}): {summary_sentence.lower()}"
+
+    print(f"{BOLD}{BLUE}--- DRAFT GIT COMMIT MESSAGE ---{RESET}\n")
+    print(f"{BOLD}{subject}{RESET}\n")
+    print(f"{summary}\n")
+
+    if files:
+        print("Files affected:")
+        for f in files:
+            print(f"  - {f}")
+
+    print(f"\n{DIM}--- End of Draft ---{RESET}")
+
+def generate_report(days=1, project_filter=None):
+    if not os.path.exists(DB_PATH):
+        print(f"Error: Database not found at {DB_PATH}", file=sys.stderr)
+        sys.exit(1)
+
+    now_ms = int(datetime.now().timestamp() * 1000)
+    cutoff_ms = now_ms - (days * 24 * 60 * 60 * 1000)
+
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+
+    query = """
+    SELECT key, conversation_id, value, updated_at, 'v2' as source
+    FROM conversations_v2
+    UNION ALL
+    SELECT key, 'legacy' as conversation_id, value, 0 as updated_at, 'v1' as source
+    FROM conversations
+    ORDER BY updated_at DESC;
+    """
+
+    try:
+        cursor.execute(query)
+        rows = cursor.fetchall()
+    except sqlite3.OperationalError as e:
+        print(f"Error reading database: {e}", file=sys.stderr)
+        conn.close()
+        sys.exit(1)
+
+    conn.close()
+
+    report_entries = []
+    for key, conv_id, value, updated_at, source in rows:
+        try:
+            data = json.loads(value)
+
+            updated_at_val = updated_at if updated_at > 0 else 0
+
+            if updated_at_val < cutoff_ms:
+                continue
+
+            project_name = os.path.basename(key)
+            if project_filter:
+                if project_filter.lower() not in project_name.lower() and project_filter.lower() not in key.lower():
+                    continue
+
+            history = data.get("history", [])
+            msg_count = len(history)
+            model_info = data.get("model_info") or {}
+            model = model_info.get("model_id", "auto")
+            summary = data.get("latest_summary") or "No summary available."
+            transcript = data.get("transcript", [])
+
+            initial_query = ""
+            for line in transcript:
+                line_stripped = line.strip()
+                if line_stripped.startswith("> "):
+                    initial_query = line_stripped[2:].strip()
+                    break
+
+            tracker = data.get("file_line_tracker") or {}
+            files_touched = [os.path.basename(f) for f in tracker.keys()]
+
+            dt = datetime.fromtimestamp(updated_at_val / 1000)
+            date_str = dt.strftime("%Y-%m-%d %H:%M")
+
+            report_entries.append({
+                "project": project_name,
+                "path": key,
+                "id": conv_id,
+                "date_str": date_str,
+                "model": model,
+                "msg_count": msg_count,
+                "initial_query": initial_query or "No query found.",
+                "summary": summary,
+                "files_touched": files_touched,
+                "source": source
+            })
+        except Exception:
+            continue
+
+    print(f"# Standup Report (Past {days} Day(s))\n")
+    print(f"Generated on {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+
+    if not report_entries:
+        print("No active sessions found in this period matching the criteria.")
+        return
+
+    projects = {}
+    for entry in report_entries:
+        projects.setdefault(entry["project"], []).append(entry)
+
+    for proj, entries in projects.items():
+        print(f"## Project: {BOLD}{BLUE}{proj}{RESET}")
+        print(f"**Path:** `{entries[0]['path']}`\n")
+
+        for idx, entry in enumerate(entries, 1):
+            print(f"### Session {idx} ({entry['date_str']})")
+            print(f"- **ID:** `{entry['id']}` ({entry['source']})")
+            print(f"- **Model:** `{entry['model']}`")
+            print(f"- **Messages:** {entry['msg_count']}")
+            print(f"- **Initial Query:** *\"{entry['initial_query']}\"*")
+            print(f"- **Summary:** {entry['summary']}")
+            if entry["files_touched"]:
+                files_list = ", ".join([f"`{f}`" for f in entry["files_touched"]])
+                print(f"- **Files Touched:** {files_list}")
+            else:
+                print(f"- **Files Touched:** None")
+            print()
+        print("-" * 50)
+
+def journal_project(project_path=None):
+    if not os.path.exists(DB_PATH):
+        print(f"Error: Database not found at {DB_PATH}", file=sys.stderr)
+        sys.exit(1)
+
+    path = project_path or os.getcwd()
+    abs_path = os.path.abspath(path)
+
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+
+    query = """
+    SELECT value, updated_at, 'v2' as source FROM conversations_v2 WHERE key = ?
+    UNION ALL
+    SELECT value, 0 as updated_at, 'v1' as source FROM conversations WHERE key = ?
+    """
+
+    try:
+        cursor.execute(query, (abs_path, abs_path))
+        rows = cursor.fetchall()
+    except sqlite3.OperationalError as e:
+        print(f"Error reading database: {e}", file=sys.stderr)
+        conn.close()
+        sys.exit(1)
+
+    conn.close()
+
+    entries = []
+    for value, updated_at, source in rows:
+        try:
+            data = json.loads(value)
+            transcript = data.get("transcript", [])
+            summary = data.get("latest_summary") or "No summary available."
+
+            first_query = ""
+            for line in transcript:
+                line_stripped = line.strip()
+                if line_stripped.startswith("> "):
+                    first_query = line_stripped[2:].strip()
+                    break
+
+            dt = datetime.fromtimestamp(updated_at / 1000) if updated_at > 0 else datetime.fromtimestamp(0)
+            entries.append({
+                "date": dt,
+                "date_str": dt.strftime("%Y-%m-%d %H:%M"),
+                "source": source,
+                "first_query": first_query or "No query found.",
+                "summary": summary
+            })
+        except Exception:
+            continue
+
+    entries.sort(key=lambda x: x["date"])
+
+    project_name = os.path.basename(abs_path)
+    print(f"# Project Journal: {BOLD}{BLUE}{project_name}{RESET}")
+    print(f"{DIM}Path: {abs_path}{RESET}\n")
+
+    if not entries:
+        print("No journaling history found for this project.")
+        return
+
+    for idx, entry in enumerate(entries, 1):
+        print(f"## Entry {idx} - {YELLOW}{entry['date_str']}{RESET} ({CYAN}{entry['source']}{RESET})")
+        print(f"{BOLD}First Query:{RESET} {ITALIC}{entry['first_query']}{RESET}")
+        print(f"{BOLD}Summary:{RESET}\n{entry['summary']}")
+        print("-" * 40)
+
+def prune_sessions(days, min_messages, apply, force):
+    if not os.path.exists(DB_PATH):
+        print(f"Error: Database not found at {DB_PATH}", file=sys.stderr)
+        sys.exit(1)
+
+    now_ms = int(datetime.now().timestamp() * 1000)
+    cutoff_ms = now_ms - (days * 24 * 60 * 60 * 1000)
+
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+
+    query = """
+    SELECT key, conversation_id, value, updated_at, 'v2' as source
+    FROM conversations_v2
+    UNION ALL
+    SELECT key, 'legacy' as conversation_id, value, 0 as updated_at, 'v1' as source
+    FROM conversations;
+    """
+
+    try:
+        cursor.execute(query)
+        rows = cursor.fetchall()
+    except sqlite3.OperationalError as e:
+        print(f"Error reading database: {e}", file=sys.stderr)
+        conn.close()
+        sys.exit(1)
+
+    to_delete = []
+    for row in rows:
+        key, conv_id, value, updated_at, source = row
+        try:
+            data = json.loads(value)
+            history = data.get("history", [])
+            msg_count = len(history)
+
+            updated_at_val = updated_at if updated_at > 0 else 0
+
+            if updated_at_val < cutoff_ms:
+                if min_messages == 0 or msg_count < min_messages:
+                    dt = datetime.fromtimestamp(updated_at_val / 1000)
+                    date_str = dt.strftime("%Y-%m-%d %H:%M")
+                    project = os.path.basename(key)
+                    to_delete.append((conv_id, key, source, project, msg_count, date_str))
+        except Exception:
+            continue
+
+    if not to_delete:
+        print("No sessions found matching the pruning criteria.", file=sys.stderr)
+        conn.close()
+        return
+
+    mode_str = "[Dry Run] Would delete" if not apply else "Deleting"
+    print(f"{mode_str} {len(to_delete)} session(s):", file=sys.stderr)
+    for conv_id, key, source, project, msg_count, date_str in to_delete:
+        print(f"  - {BOLD}{project}{RESET} ({source}, ID: {conv_id}, Date: {date_str}, Messages: {msg_count})", file=sys.stderr)
+
+    if not apply:
+        print("\nThis was a dry run. Use --apply to execute the prune.", file=sys.stderr)
+        conn.close()
+        return
+
+    if not force:
+        try:
+            confirm = input("Are you sure? [y/N]: ").strip().lower()
+            if confirm != 'y':
+                print("Prune cancelled.", file=sys.stderr)
+                conn.close()
+                return
+        except KeyboardInterrupt:
+            print("\nPrune cancelled.", file=sys.stderr)
+            conn.close()
+            return
+
+    active_map = get_active_sessions()
+    deleted_count = 0
+    for conv_id, key, source, project, msg_count, date_str in to_delete:
+        pid = active_map.get(key)
+        if pid:
+            try:
+                os.kill(pid, 15)
+            except OSError:
+                pass
+
+        if source == "v1":
+            cursor.execute("DELETE FROM conversations WHERE key = ?", (key,))
+        else:
+            cursor.execute(
+                "DELETE FROM conversations_v2 WHERE conversation_id = ? AND key = ?",
+                (conv_id, key)
+            )
+
+        if source == "v2":
+            for ext in (".json", ".lock"):
+                path = os.path.join(SESSIONS_DIR, conv_id + ext)
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+        deleted_count += 1
+
+    conn.commit()
+    conn.close()
+    print(f"Successfully pruned {deleted_count} session(s).", file=sys.stderr)
+
+def jump_to_project():
+    if not os.path.exists(DB_PATH):
+        print(f"Error: Database not found at {DB_PATH}", file=sys.stderr)
+        sys.exit(1)
+
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+
+    paths_v2 = {}
+    try:
+        cursor.execute("SELECT key, MAX(updated_at) FROM conversations_v2 GROUP BY key")
+        for row in cursor.fetchall():
+            paths_v2[row[0]] = row[1] or 0
+    except sqlite3.OperationalError:
+        pass
+
+    paths_v1 = {}
+    try:
+        cursor.execute("SELECT key FROM conversations GROUP BY key")
+        for row in cursor.fetchall():
+            paths_v1[row[0]] = 0
+    except sqlite3.OperationalError:
+        pass
+
+    conn.close()
+
+    merged = {}
+    for k, v in paths_v2.items():
+        merged[k] = max(merged.get(k, 0), v)
+    for k, v in paths_v1.items():
+        merged[k] = max(merged.get(k, 0), v)
+
+    valid_paths = []
+    for path, ts in merged.items():
+        abs_path = os.path.abspath(path)
+        if os.path.exists(abs_path) and os.path.isdir(abs_path):
+            valid_paths.append((abs_path, ts))
+
+    valid_paths.sort(key=lambda x: x[1], reverse=True)
+
+    if not valid_paths:
+        print("No valid project directories found.", file=sys.stderr)
+        return
+
+    fzf_input = "\n".join([p[0] for p in valid_paths])
+    fzf_cmd = ["fzf"]
+    if is_fzf_tmux_supported():
+        fzf_cmd.append("--tmux")
+
+    fzf_cmd.extend([
+        "--ansi",
+        "--reverse",
+        "--header", "Select a project directory to jump to",
+        "--height", "40%",
+    ])
+
+    try:
+        process = subprocess.Popen(
+            fzf_cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=sys.stderr,
+            text=True
+        )
+        stdout, _ = process.communicate(input=fzf_input)
+        if process.returncode == 0 and stdout:
+            selected_path = stdout.strip()
+            print(f"cd {shlex.quote(selected_path)}")
+    except FileNotFoundError:
+        print("Error: 'fzf' is not installed.", file=sys.stderr)
+        sys.exit(1)
+
 def main():
     parser = argparse.ArgumentParser(description="Global session resume support for kiro-cli")
     subparsers = parser.add_subparsers(dest="command")
@@ -588,6 +1127,28 @@ def main():
 
     parser_search = subparsers.add_parser("search", help="Search session transcripts")
     parser_search.add_argument("query", help="Search term")
+
+    parser_jump = subparsers.add_parser("jump", help="Jump to a project directory")
+
+    parser_prune = subparsers.add_parser("prune", help="Prune old/inactive sessions")
+    parser_prune.add_argument("--days", type=int, default=30, help="Delete sessions older than N days")
+    parser_prune.add_argument("--min-messages", type=int, default=0, help="Delete sessions with fewer than N messages")
+    parser_prune.add_argument("--apply", action="store_true", help="Apply deletions (defaults to dry-run)")
+    parser_prune.add_argument("--force", action="store_true", help="Force deletion without interactive confirmation")
+
+    parser_journal = subparsers.add_parser("journal", help="Generate a project journal")
+    parser_journal.add_argument("project_path", nargs="?", default=None, help="Project path (defaults to current directory)")
+
+    parser_restore = subparsers.add_parser("restore", help="Restore and open workspace files")
+    parser_restore.add_argument("session_id", help="Session ID to restore files from")
+    parser_restore.add_argument("--keys", dest="key", help="The session directory path")
+    parser_restore.add_argument("--editor", help="Editor to open files in")
+
+    parser_report = subparsers.add_parser("report", help="Generate a standup/work report")
+    parser_report.add_argument("--days", type=int, default=1, help="Aggregate sessions over past N days")
+    parser_report.add_argument("--project", help="Optional project filter (key/path)")
+
+    parser_commit = subparsers.add_parser("commit-draft", help="Draft a git commit message from the recent session")
 
     args = parser.parse_args()
 
@@ -642,6 +1203,30 @@ def main():
             update_session(selected)
             safe_key = shlex.quote(selected['key'])
             print(f"cd {safe_key} && kiro-cli chat --resume")
+        return
+
+    if args.command == "jump":
+        jump_to_project()
+        return
+
+    if args.command == "prune":
+        prune_sessions(args.days, args.min_messages, args.apply, args.force)
+        return
+
+    if args.command == "journal":
+        journal_project(args.project_path)
+        return
+
+    if args.command == "restore":
+        restore_files(args.session_id, args.key, args.editor)
+        return
+
+    if args.command == "report":
+        generate_report(args.days, args.project)
+        return
+
+    if args.command == "commit-draft":
+        commit_draft()
         return
 
     # Interactive picker mode
