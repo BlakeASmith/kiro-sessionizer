@@ -560,6 +560,106 @@ def search_sessions(query):
     conn.close()
     return results
 
+def generate_journal(project_path=None):
+    if not os.path.exists(DB_PATH):
+        print(f"Error: Database not found at {DB_PATH}", file=sys.stderr)
+        return
+
+    if not project_path:
+        project_path = "."
+
+    abs_path = os.path.abspath(project_path)
+
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+
+    query = """
+    SELECT key, conversation_id, value, updated_at, source FROM (
+        SELECT key, conversation_id, value, updated_at, 'v2' as source
+        FROM conversations_v2
+        UNION ALL
+        SELECT key, 'legacy' as conversation_id, value, 0 as updated_at, 'v1' as source
+        FROM conversations
+    )
+    WHERE key = ?
+    ORDER BY updated_at ASC;
+    """
+
+    try:
+        cursor.execute(query, (abs_path,))
+        rows = cursor.fetchall()
+    except sqlite3.OperationalError:
+        rows = []
+        try:
+            cursor.execute("SELECT key, 'legacy' as conversation_id, value, 0 as updated_at, 'v1' as source FROM conversations WHERE key = ?", (abs_path,))
+            rows = cursor.fetchall()
+        except sqlite3.OperationalError:
+            pass
+    finally:
+        conn.close()
+
+    if not rows:
+        print(f"No journal entries found for project: {abs_path}")
+        return
+
+    print(f"{BOLD}{BLUE}--- Chronological Developer Journal for {os.path.basename(abs_path)} ---{RESET}")
+    print(f"{DIM}Path: {abs_path}{RESET}\n")
+
+    for idx, row in enumerate(rows, 1):
+        key, conv_id, value, updated_at, source = row
+        try:
+            data = json.loads(value)
+            transcript = data.get("transcript", [])
+            history = data.get("history", [])
+            model_info = data.get("model_info", {})
+            model = model_info.get("model_id", "auto")
+            summary = data.get("latest_summary")
+            msg_count = len(history)
+
+            # Determine the first user query
+            first_user_msg = ""
+            for line in transcript:
+                line_str = line.strip()
+                if line_str and line_str.startswith("> "):
+                    first_user_msg = line_str[2:].strip().replace("\n", " ")
+                    break
+
+            # Fallback if transcript was not structured or empty
+            if not first_user_msg and history:
+                try:
+                    first_turn = history[0]
+                    user_turn = first_turn.get("user", {})
+                    content = user_turn.get("content", {})
+                    prompt_obj = content.get("Prompt", {})
+                    first_user_msg = prompt_obj.get("prompt", "").strip().replace("\n", " ")
+                except:
+                    pass
+
+            dt = datetime.fromtimestamp(updated_at / 1000) if updated_at > 0 else datetime.now()
+            date_str = dt.strftime("%Y-%m-%d %H:%M")
+
+            print(f"{BOLD}{GREEN}[Entry #{idx}] {date_str}{RESET} | {BOLD}{CYAN}Model:{RESET} {model} | {BOLD}{MAGENTA}Messages:{RESET} {msg_count}")
+            print(f"{DIM}Session ID: {conv_id}{RESET}")
+            if first_user_msg:
+                print(f"  {BOLD}First Query:{RESET} {first_user_msg}")
+
+            if summary:
+                print(f"  {BOLD}Summary:{RESET} {summary.strip()}")
+            else:
+                last_assistant_msg = ""
+                for line in transcript:
+                    line_str = line.strip()
+                    if line_str and not line_str.startswith("> ") and not line_str.startswith("[Tool uses:"):
+                        content = line_str[10:].strip() if line_str.startswith("Assistant:") else line_str
+                        last_assistant_msg = content.replace("\n", " ")
+                if last_assistant_msg:
+                    if len(last_assistant_msg) > 150:
+                        last_assistant_msg = last_assistant_msg[:147] + "..."
+                    print(f"  {BOLD}Outcome (Latest):{RESET} {last_assistant_msg}")
+            print("-" * 40)
+        except Exception:
+            continue
+
 def main():
     parser = argparse.ArgumentParser(description="Global session resume support for kiro-cli")
     subparsers = parser.add_subparsers(dest="command")
@@ -589,7 +689,14 @@ def main():
     parser_search = subparsers.add_parser("search", help="Search session transcripts")
     parser_search.add_argument("query", help="Search term")
 
+    parser_journal = subparsers.add_parser("journal", help="Generate a chronological summary of a project's history")
+    parser_journal.add_argument("path", nargs="?", default=".", help="Project path (default: current directory)")
+
     args = parser.parse_args()
+
+    if args.command == "journal":
+        generate_journal(args.path)
+        return
 
     if args.command == "preview":
         run_preview(args.path, args.conv_id, args.pid, args.project)
