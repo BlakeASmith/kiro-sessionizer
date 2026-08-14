@@ -7,14 +7,18 @@
 if [ $# -eq 0 ]; then
     COMMAND=$(kiro_sessionizer)
     if [ -n "$COMMAND" ]; then
-        eval "$COMMAND"
+        if [[ "$COMMAND" == cd\ * || "$COMMAND" == tmux\ * ]]; then
+            eval "$COMMAND"
+        else
+            echo "$COMMAND"
+        fi
     fi
 else
-    # Check if the subcommand might return a resume command (search or continue)
+    # Check if the subcommand might return a resume/jump command
     case "$1" in
-        search|continue)
+        search|continue|jump)
             COMMAND=$(kiro_sessionizer "$@")
-            if [[ "$COMMAND" == cd\ * ]]; then
+            if [[ "$COMMAND" == cd\ * || "$COMMAND" == tmux\ * ]]; then
                 eval "$COMMAND"
             else
                 echo "$COMMAND"
